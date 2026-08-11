@@ -12,6 +12,7 @@
 #include "rtsp_events.h"
 #include "esp_timer.h"
 #include "freertos/queue.h"
+#include "cJSON.h"
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -53,6 +54,32 @@ static uint32_t s_sample_rate = 0;
 
 // Defined in the coexistence section at the end of this file.
 static void radio_coex_init(void);
+static void radio_meta_task(void *arg);
+
+// The display leaves its "AirPlay Ready" standby screen only on
+// RTSP_EVENT_PLAYING, so the radio has to announce itself on the same event bus
+// it listens to. That is a loop: our own coex handler reads PLAYING as "an
+// AirPlay session started, yield the channel" and the radio would hand off to
+// itself.
+//
+// rtsp_events_emit() dispatches synchronously in the calling task, so recording
+// the task handle for the duration of the emit identifies our own events
+// exactly. A bare bool would race: a real AirPlay event arriving on another task
+// mid-emit would be discarded.
+static volatile TaskHandle_t s_self_emit_task = NULL;
+
+// True while an AirPlay session owns the output. Used to decide whether
+// stopping the radio should return the display to standby: when AirPlay is the
+// reason we stopped, its own events drive the screen and ours would blank a live
+// session.
+static volatile bool s_airplay_active = false;
+
+static void radio_emit(rtsp_event_t event, const rtsp_event_data_t *data) {
+  s_self_emit_task = xTaskGetCurrentTaskHandle();
+  rtsp_events_emit(event, data);
+  s_self_emit_task = NULL;
+}
+static TaskHandle_t s_meta_task = NULL;
 
 // ============================================================================
 // Connection handling — owned entirely by the fill task
@@ -402,6 +429,9 @@ esp_err_t radio_source_start(void) {
                           &s_drain_task, 0);
   xTaskCreatePinnedToCore(radio_fill_task, "radio_fill", 4096, NULL, 5,
                           &s_fill_task, 0);
+  // Low priority: metadata must never compete with audio.
+  xTaskCreatePinnedToCore(radio_meta_task, "radio_meta", 5120, NULL, 3,
+                          &s_meta_task, 0);
   ESP_LOGI(TAG, "started");
   return ESP_OK;
 }
@@ -413,13 +443,18 @@ void radio_source_stop(void) {
   s_running = false;
   // Tasks observe s_running and exit on their own; wait briefly so the socket is
   // closed and I2S released before a caller starts another source.
-  for (int i = 0; i < 50 && (s_fill_task || s_drain_task); i++) {
+  for (int i = 0; i < 50 && (s_fill_task || s_drain_task || s_meta_task); i++) {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
   // Give the output back to AirPlay: restart the playback task we stopped when
   // taking ownership.
   audio_output_start();
   ESP_LOGI(TAG, "stopped, I2S returned to AirPlay");
+  // Hand the screen back to standby, but not when AirPlay is why we stopped —
+  // it publishes its own state and ours would wipe a connecting session.
+  if (!s_airplay_active) {
+    radio_emit(RTSP_EVENT_DISCONNECTED, NULL);
+  }
 }
 
 bool radio_source_is_playing(void) {
@@ -519,11 +554,16 @@ static void coex_resume_timer_cb(void *arg) {
 
 static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
                           void *user_data) {
+  // Ignore the events we published ourselves (see radio_emit).
+  if (s_self_emit_task == xTaskGetCurrentTaskHandle()) {
+    return;
+  }
   (void)data;
   (void)user_data;
   switch (event) {
   case RTSP_EVENT_CLIENT_CONNECTED:
   case RTSP_EVENT_PLAYING:
+    s_airplay_active = true;
     if (s_resume_timer) {
       esp_timer_stop(s_resume_timer); // cancel any pending resume
     }
@@ -534,6 +574,7 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
     // rather than fighting the radio for the channel.
     break;
   case RTSP_EVENT_DISCONNECTED:
+    s_airplay_active = false;
     if (s_mode == SOURCE_MODE_RADIO && s_resume_timer) {
       esp_timer_start_once(s_resume_timer, COEX_RESUME_DELAY_US);
     }
@@ -559,4 +600,134 @@ static void radio_coex_init(void) {
   rtsp_events_register(on_rtsp_event, NULL);
   ESP_LOGI(TAG, "automatic AirPlay handover armed (resume delay %ds)",
            COEX_RESUME_DELAY_US / 1000000);
+}
+
+// ============================================================================
+// Now-playing metadata
+// ============================================================================
+//
+// Polls the station's AzuraCast JSON and republishes it as RTSP_EVENT_METADATA.
+// The display component subscribes to that event bus already, so this needs no
+// display changes at all — a2dp_sink.c publishes Bluetooth track info the same
+// way.
+//
+// Runs only while the radio holds the output. An AirPlay session publishes its
+// own metadata, and polling through it would overwrite the screen with whatever
+// the station happens to be playing.
+
+#define META_JSON_MAX 8192
+
+// Fetch the whole body into buf. Returns length, or -1.
+static int meta_fetch(char *buf, size_t cap) {
+  esp_http_client_config_t cfg = {
+      .url = CONFIG_RADIO_NOWPLAYING_URL,
+      .timeout_ms = 5000,
+  };
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (!c) {
+    return -1;
+  }
+
+  int total = -1;
+  if (esp_http_client_open(c, 0) == ESP_OK) {
+    esp_http_client_fetch_headers(c);
+    if (esp_http_client_get_status_code(c) == 200) {
+      total = 0;
+      while ((size_t)total < cap - 1) {
+        int n = esp_http_client_read(c, buf + total, (int)(cap - 1 - total));
+        if (n <= 0) {
+          break;
+        }
+        total += n;
+      }
+      buf[total > 0 ? total : 0] = 0;
+    }
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+  return total;
+}
+
+static void radio_meta_task(void *arg) {
+  (void)arg;
+  char *buf = heap_caps_malloc(META_JSON_MAX, MALLOC_CAP_SPIRAM);
+  if (!buf) {
+    ESP_LOGW(TAG, "metadata buffer alloc failed — no now-playing info");
+    s_meta_task = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  char last_title[128] = {0};
+  char last_artist[128] = {0};
+  uint32_t wait_ms = 0; // poll immediately on start
+
+  // Announce before the first fetch so the screen stops claiming "AirPlay
+  // Ready" the moment audio starts. The real track replaces this within a
+  // second, and it stays honest if the station's API is unreachable.
+  {
+    rtsp_event_data_t ev = {0};
+    strlcpy(ev.metadata.title, "Vibe Radio", sizeof(ev.metadata.title));
+    radio_emit(RTSP_EVENT_METADATA, &ev);
+    radio_emit(RTSP_EVENT_PLAYING, NULL);
+  }
+
+  while (s_running) {
+    if (wait_ms > 0) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      wait_ms = wait_ms > 250 ? wait_ms - 250 : 0;
+      continue;
+    }
+    wait_ms = CONFIG_RADIO_NOWPLAYING_MS;
+
+    int len = meta_fetch(buf, META_JSON_MAX);
+    if (len <= 0) {
+      ESP_LOGD(TAG, "now-playing fetch failed");
+      continue;
+    }
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+      ESP_LOGW(TAG, "now-playing JSON parse failed (%d bytes)", len);
+      continue;
+    }
+
+    cJSON *np = cJSON_GetObjectItem(root, "now_playing");
+    cJSON *song = np ? cJSON_GetObjectItem(np, "song") : NULL;
+    if (song) {
+      const cJSON *t = cJSON_GetObjectItem(song, "title");
+      const cJSON *a = cJSON_GetObjectItem(song, "artist");
+      const cJSON *al = cJSON_GetObjectItem(song, "album");
+      const cJSON *dur = cJSON_GetObjectItem(np, "duration");
+      const cJSON *ela = cJSON_GetObjectItem(np, "elapsed");
+
+      const char *title = cJSON_IsString(t) ? t->valuestring : "";
+      const char *artist = cJSON_IsString(a) ? a->valuestring : "";
+      const char *album = cJSON_IsString(al) ? al->valuestring : "";
+
+      // Only publish on a track change: the display re-renders on every event and
+      // a 15s heartbeat of identical text would restart its scroll animation.
+      if (strcmp(title, last_title) != 0 || strcmp(artist, last_artist) != 0) {
+        strlcpy(last_title, title, sizeof(last_title));
+        strlcpy(last_artist, artist, sizeof(last_artist));
+
+        rtsp_event_data_t ev = {0};
+        strlcpy(ev.metadata.title, title, sizeof(ev.metadata.title));
+        strlcpy(ev.metadata.artist, artist, sizeof(ev.metadata.artist));
+        strlcpy(ev.metadata.album, album, sizeof(ev.metadata.album));
+        ev.metadata.duration_secs =
+            cJSON_IsNumber(dur) ? (uint32_t)dur->valuedouble : 0;
+        ev.metadata.position_secs =
+            cJSON_IsNumber(ela) ? (uint32_t)ela->valuedouble : 0;
+
+        ESP_LOGI(TAG, "now playing: %s - %s", artist, title);
+        radio_emit(RTSP_EVENT_METADATA, &ev);
+      }
+    }
+    cJSON_Delete(root);
+  }
+
+  heap_caps_free(buf);
+  s_meta_task = NULL;
+  vTaskDelete(NULL);
 }

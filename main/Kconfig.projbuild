@@ -556,6 +556,20 @@ menu "Internet Radio Source"
             begins is the depth that persists. 98304 is about 6 seconds at
             128 kbps, and playback starts that much later.
 
+    config RADIO_NOWPLAYING_URL
+        string "Now-playing API URL"
+        default "http://viberadio.one/api/nowplaying/vibe_radio"
+        depends on RADIO_ENABLED
+        help
+            AzuraCast-style JSON endpoint. Polled only while the radio is the
+            active source, so an AirPlay session's own metadata is never
+            overwritten.
+
+    config RADIO_NOWPLAYING_MS
+        int "Now-playing poll interval (ms)"
+        default 15000
+        depends on RADIO_ENABLED
+
     config RADIO_STALL_MS
         int "Milliseconds of no data before reconnecting"
         default 1500
