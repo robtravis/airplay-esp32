@@ -13,6 +13,7 @@
 #include "mdns_airplay.h"
 #include "nvs_flash.h"
 #include "playback_control.h"
+#include "radio/archive.h"
 #include "radio/radio_source.h"
 #include "ptp_clock.h"
 #include "rtsp_server.h"
@@ -93,6 +94,8 @@ static void start_airplay_services(void) {
     // Honour the saved mode: radio by default, AirPlay if the user switched it in
     // settings. Radio takes exclusive ownership of I2S when it starts.
     radio_source_apply_saved_mode();
+    // Catalogue is not fetched until the archive menu is opened.
+    archive_init();
     // Do not rely on having received the one-shot PLAYING event — ask.
     if (radio_source_is_playing()) {
       led_ring_set_state(LED_RING_STREAMING);

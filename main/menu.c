@@ -2,6 +2,8 @@
 
 #include "display.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "led_ring.h"
 #include "playback_control.h"
 #include "settings.h"
@@ -10,6 +12,7 @@
 #include <string.h>
 
 #ifdef CONFIG_RADIO_ENABLED
+#include "radio/archive.h"
 #include "radio/radio_source.h"
 #endif
 
@@ -25,27 +28,51 @@ typedef enum {
   LEVEL_LED_FX,
   LEVEL_BRIGHTNESS,
   LEVEL_SOURCE,
+  LEVEL_ARCHIVE_SHOWS,
+  LEVEL_ARCHIVE_EPISODES,
   LEVEL_INFO,
 } menu_level_t;
 
-#define MAX_ROWS 12
-#define LABEL_MAX 24
+// Each row carries what it does, rather than the caller re-deriving it from the
+// row index. Index arithmetic broke as soon as rows became conditional.
+typedef enum {
+  ACT_NONE = 0,
+  ACT_BACK,
+  ACT_OPEN_LEVEL,
+  ACT_SET_FX,
+  ACT_SET_SCALE,
+  ACT_SET_IDLE_MODE,
+  ACT_OPEN_SHOW,
+  ACT_PLAY_EPISODE,
+  ACT_STOP_ARCHIVE,
+} action_t;
+
+// Must hold the whole archive show list plus "< BACK": 40 shows truncated at 16
+// would have hidden most of the catalogue with no indication.
+#define MAX_ROWS  48
+#define LABEL_MAX 26
 
 static menu_level_t s_level = LEVEL_NONE;
 static int s_sel = 0;
+static int s_show = -1; // show being browsed in LEVEL_ARCHIVE_EPISODES
 
-// Rendered rows for the current level, rebuilt on every change. Held as storage
-// rather than pointers into other modules so nothing dangles mid-redraw.
 static char s_rows[MAX_ROWS][LABEL_MAX];
 static const char *s_row_ptrs[MAX_ROWS];
+static action_t s_row_action[MAX_ROWS];
+static int s_row_payload[MAX_ROWS];
 static int s_row_count = 0;
 static char s_header[LABEL_MAX];
 
-// Brightness steps offered on device. Fine control stays in the web UI.
+// The archive fetch completes on its own task and wants to redraw the list, so
+// every entry point is serialised.
+static SemaphoreHandle_t s_lock = NULL;
+#define MENU_LOCK()   xSemaphoreTake(s_lock, portMAX_DELAY)
+#define MENU_UNLOCK() xSemaphoreGive(s_lock)
+
 static const int s_brightness_steps[] = {24, 48, 96, 160, 255};
 #define N_BRIGHTNESS (int)(sizeof(s_brightness_steps) / sizeof(int))
 
-static void row_add(const char *fmt, ...) {
+static void row_add(action_t act, int payload, const char *fmt, ...) {
   if (s_row_count >= MAX_ROWS) {
     return;
   }
@@ -54,6 +81,8 @@ static void row_add(const char *fmt, ...) {
   vsnprintf(s_rows[s_row_count], LABEL_MAX, fmt, ap);
   va_end(ap);
   s_row_ptrs[s_row_count] = s_rows[s_row_count];
+  s_row_action[s_row_count] = act;
+  s_row_payload[s_row_count] = payload;
   s_row_count++;
 }
 
@@ -63,64 +92,98 @@ static void build_and_draw(void) {
   switch (s_level) {
   case LEVEL_ROOT:
     snprintf(s_header, sizeof(s_header), "MENU");
-    row_add(BACK_LABEL);
-    row_add("LED FX: %s", led_ring_effect_name(led_ring_get_effect()));
-    row_add("BRIGHTNESS: %d", led_ring_get_scale());
+    row_add(ACT_BACK, 0, BACK_LABEL);
 #ifdef CONFIG_RADIO_ENABLED
-    row_add("IDLE: %s", radio_source_get_mode() == SOURCE_MODE_RADIO
-                            ? "RADIO"
-                            : "SILENT");
+    row_add(ACT_OPEN_LEVEL, LEVEL_ARCHIVE_SHOWS, "ARCHIVE SHOWS");
+    if (archive_is_playing()) {
+      row_add(ACT_STOP_ARCHIVE, 0, "BACK TO LIVE");
+    }
 #endif
-    row_add("VOLUME: %d%%", playback_control_get_volume_percent());
-    row_add("INFO");
+    row_add(ACT_OPEN_LEVEL, LEVEL_LED_FX, "LED FX: %s",
+            led_ring_effect_name(led_ring_get_effect()));
+    row_add(ACT_OPEN_LEVEL, LEVEL_BRIGHTNESS, "BRIGHTNESS: %d",
+            led_ring_get_scale());
+#ifdef CONFIG_RADIO_ENABLED
+    row_add(ACT_OPEN_LEVEL, LEVEL_SOURCE, "IDLE: %s",
+            radio_source_get_mode() == SOURCE_MODE_RADIO ? "RADIO" : "SILENT");
+#endif
+    row_add(ACT_NONE, 0, "VOLUME: %d%%",
+            playback_control_get_volume_percent());
+    row_add(ACT_OPEN_LEVEL, LEVEL_INFO, "INFO");
     break;
 
   case LEVEL_LED_FX:
     snprintf(s_header, sizeof(s_header), "LED FX");
-    row_add(BACK_LABEL);
+    row_add(ACT_BACK, 0, BACK_LABEL);
     for (int i = 0; i < LED_FX_COUNT; i++) {
-      // Mark the active one: with no cursor memory across opens, the list has to
-      // say which effect is currently running.
-      row_add("%s%s", i == led_ring_get_effect() ? "* " : "  ",
+      // Mark the running one: the cursor does not remember where it was, so the
+      // list has to say what is active.
+      row_add(ACT_SET_FX, i, "%s%s", i == led_ring_get_effect() ? "* " : "  ",
               led_ring_effect_name(i));
     }
     break;
 
   case LEVEL_BRIGHTNESS:
     snprintf(s_header, sizeof(s_header), "BRIGHTNESS");
-    row_add(BACK_LABEL);
+    row_add(ACT_BACK, 0, BACK_LABEL);
     for (int i = 0; i < N_BRIGHTNESS; i++) {
-      row_add("%s%d", s_brightness_steps[i] == led_ring_get_scale() ? "* " : "  ",
+      row_add(ACT_SET_SCALE, s_brightness_steps[i], "%s%d",
+              s_brightness_steps[i] == led_ring_get_scale() ? "* " : "  ",
               s_brightness_steps[i]);
     }
     break;
 
+#ifdef CONFIG_RADIO_ENABLED
   case LEVEL_SOURCE:
     snprintf(s_header, sizeof(s_header), "WHEN IDLE");
-    row_add(BACK_LABEL);
-#ifdef CONFIG_RADIO_ENABLED
-    row_add("%sPLAY RADIO",
+    row_add(ACT_BACK, 0, BACK_LABEL);
+    row_add(ACT_SET_IDLE_MODE, SOURCE_MODE_RADIO, "%sPLAY RADIO",
             radio_source_get_mode() == SOURCE_MODE_RADIO ? "* " : "  ");
-    row_add("%sSTAY SILENT",
+    row_add(ACT_SET_IDLE_MODE, SOURCE_MODE_AIRPLAY, "%sSTAY SILENT",
             radio_source_get_mode() == SOURCE_MODE_AIRPLAY ? "* " : "  ");
-#endif
     break;
+
+  case LEVEL_ARCHIVE_SHOWS:
+    snprintf(s_header, sizeof(s_header), "ARCHIVE");
+    row_add(ACT_BACK, 0, BACK_LABEL);
+    if (archive_is_loading()) {
+      row_add(ACT_NONE, 0, "LOADING...");
+    } else if (!archive_is_ready()) {
+      row_add(ACT_NONE, 0, "UNAVAILABLE");
+    } else {
+      for (int i = 0; i < archive_show_count(); i++) {
+        row_add(ACT_OPEN_SHOW, i, "%s", archive_show_name(i));
+      }
+    }
+    break;
+
+  case LEVEL_ARCHIVE_EPISODES:
+    snprintf(s_header, sizeof(s_header), "%s", archive_show_name(s_show));
+    row_add(ACT_BACK, 0, BACK_LABEL);
+    for (int i = 0; i < archive_episode_count(s_show); i++) {
+      row_add(ACT_PLAY_EPISODE, i, "%s", archive_episode_label(s_show, i));
+    }
+    break;
+#endif
 
   case LEVEL_INFO: {
     snprintf(s_header, sizeof(s_header), "INFO");
-    row_add(BACK_LABEL);
+    row_add(ACT_BACK, 0, BACK_LABEL);
     char name[40] = {0};
     if (settings_get_device_name(name, sizeof(name)) == ESP_OK) {
-      row_add("%s", name);
+      row_add(ACT_NONE, 0, "%s", name);
     }
-    row_add("VOL %d%%", playback_control_get_volume_percent());
-    row_add("FX %s", led_ring_effect_name(led_ring_get_effect()));
+    row_add(ACT_NONE, 0, "VOL %d%%", playback_control_get_volume_percent());
+    row_add(ACT_NONE, 0, "FX %s", led_ring_effect_name(led_ring_get_effect()));
     break;
   }
 
   case LEVEL_NONE:
     display_menu_hide();
     return;
+
+  default:
+    break;
   }
 
   if (s_sel >= s_row_count) {
@@ -132,30 +195,63 @@ static void build_and_draw(void) {
   display_menu_show(s_header, s_row_ptrs, s_row_count, s_sel);
 }
 
-void menu_init(void) { s_level = LEVEL_NONE; }
+#ifdef CONFIG_RADIO_ENABLED
+/// Runs on the archive worker task when a fetch finishes.
+static void on_archive_ready(void) {
+  MENU_LOCK();
+  if (s_level == LEVEL_ARCHIVE_SHOWS) {
+    build_and_draw(); // replace "LOADING..." with the shows
+  }
+  MENU_UNLOCK();
+}
+#endif
+
+void menu_init(void) {
+  s_lock = xSemaphoreCreateMutex();
+  s_level = LEVEL_NONE;
+#ifdef CONFIG_RADIO_ENABLED
+  archive_set_ready_cb(on_archive_ready);
+#endif
+}
 
 bool menu_is_open(void) { return s_level != LEVEL_NONE; }
 
+static void go_level(menu_level_t level) {
+  s_level = level;
+  s_sel = 1; // skip < BACK — nobody enters a list to leave it
+#ifdef CONFIG_RADIO_ENABLED
+  if (level == LEVEL_ARCHIVE_SHOWS && !archive_is_ready() &&
+      !archive_is_loading()) {
+    // Only fetch when someone actually asks for the catalogue.
+    archive_start_fetch();
+  }
+#endif
+}
+
 void menu_back_or_open(void) {
+  MENU_LOCK();
   switch (s_level) {
   case LEVEL_NONE:
-    s_level = LEVEL_ROOT;
-    s_sel = 1; // skip < BACK — nobody opens a menu to leave it
+    go_level(LEVEL_ROOT);
     break;
   case LEVEL_ROOT:
     s_level = LEVEL_NONE;
     break;
+  case LEVEL_ARCHIVE_EPISODES:
+    go_level(LEVEL_ARCHIVE_SHOWS); // back to the show list, not all the way out
+    break;
   default:
-    s_level = LEVEL_ROOT;
-    s_sel = 1;
+    go_level(LEVEL_ROOT);
     break;
   }
-  ESP_LOGI(TAG, "level -> %d", (int)s_level);
   build_and_draw();
+  MENU_UNLOCK();
 }
 
 void menu_scroll(int detents) {
+  MENU_LOCK();
   if (s_level == LEVEL_NONE || s_row_count == 0) {
+    MENU_UNLOCK();
     return;
   }
   s_sel += detents;
@@ -168,50 +264,65 @@ void menu_scroll(int detents) {
     s_sel = s_row_count - 1;
   }
   build_and_draw();
+  MENU_UNLOCK();
 }
 
 void menu_select(void) {
-  if (s_level == LEVEL_NONE) {
+  MENU_LOCK();
+  if (s_level == LEVEL_NONE || s_sel < 0 || s_sel >= s_row_count) {
+    MENU_UNLOCK();
     return;
   }
-  if (s_sel == 0) { // < BACK
+
+  action_t act = s_row_action[s_sel];
+  int payload = s_row_payload[s_sel];
+
+  switch (act) {
+  case ACT_BACK:
+    MENU_UNLOCK();
     menu_back_or_open();
     return;
-  }
 
-  switch (s_level) {
-  case LEVEL_ROOT:
-    switch (s_sel) {
-    case 1: s_level = LEVEL_LED_FX; s_sel = 1; break;
-    case 2: s_level = LEVEL_BRIGHTNESS; s_sel = 1; break;
-#ifdef CONFIG_RADIO_ENABLED
-    case 3: s_level = LEVEL_SOURCE; s_sel = 1; break;
-    case 4: break; // VOLUME is a readout; the encoder changes it when closed
-    case 5: s_level = LEVEL_INFO; s_sel = 1; break;
-#else
-    case 3: break;
-    case 4: s_level = LEVEL_INFO; s_sel = 1; break;
-#endif
-    default: break;
-    }
+  case ACT_OPEN_LEVEL:
+    go_level((menu_level_t)payload);
     break;
 
-  case LEVEL_LED_FX:
-    led_ring_set_effect(s_sel - 1); // row 0 is < BACK
+  case ACT_SET_FX:
+    led_ring_set_effect(payload);
     break;
 
-  case LEVEL_BRIGHTNESS:
-    led_ring_set_scale(s_brightness_steps[s_sel - 1]);
+  case ACT_SET_SCALE:
+    led_ring_set_scale(payload);
     break;
 
 #ifdef CONFIG_RADIO_ENABLED
-  case LEVEL_SOURCE:
-    radio_source_set_mode(s_sel == 1 ? SOURCE_MODE_RADIO : SOURCE_MODE_AIRPLAY);
+  case ACT_SET_IDLE_MODE:
+    radio_source_set_mode((uint8_t)payload);
+    break;
+
+  case ACT_OPEN_SHOW:
+    s_show = payload;
+    go_level(LEVEL_ARCHIVE_EPISODES);
+    break;
+
+  case ACT_PLAY_EPISODE:
+    ESP_LOGI(TAG, "play show %d episode %d", s_show, payload);
+    archive_play(s_show, payload);
+    // Close the menu so the episode's own screen is visible.
+    s_level = LEVEL_NONE;
+    break;
+
+  case ACT_STOP_ARCHIVE:
+    archive_stop();
+    s_level = LEVEL_NONE;
     break;
 #endif
 
+  case ACT_NONE:
   default:
     break;
   }
+
   build_and_draw();
+  MENU_UNLOCK();
 }

@@ -583,6 +583,20 @@ menu "Internet Radio Source"
             begins is the depth that persists. 98304 is about 6 seconds at
             128 kbps, and playback starts that much later.
 
+    config ARCHIVE_URL
+        string "Archive / recorded shows API URL"
+        default "http://viberadio.one/api/public/recordings"
+        depends on RADIO_ENABLED
+        help
+            Returns a JSON object keyed by show name, each value an array of
+            episodes with url, recorded_at and duration_secs. Fetched only when
+            the archive menu is opened.
+
+    config ARCHIVE_BASE
+        string "Base URL for relative episode paths"
+        default "http://viberadio.one"
+        depends on RADIO_ENABLED
+
     config RADIO_STATION_NAME
         string "Station name shown on screen"
         default "VIBE RADIO"

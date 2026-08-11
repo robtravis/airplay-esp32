@@ -44,6 +44,7 @@ set( SRC_FILES
     "buttons.c"
     "encoder.c"
     "menu.c"
+    "radio/archive.c"
     "playback_control.c"
     "dacp_client.c"
 )

@@ -50,12 +50,55 @@ static TaskHandle_t s_drain_task = NULL;
 static volatile bool s_running = false;
 static volatile bool s_connected = false;
 static uint32_t s_reconnects = 0;
+
+// ── Archive playback ──────────────────────────────────────────────────────────
+// The same pipeline plays recorded shows: an episode is just an HTTP MP3, and a
+// file is an easier case than a live stream because it can be re-read. The one
+// real difference is that it ENDS, where a live stream stalling means "reconnect".
+static char s_url[192] = CONFIG_RADIO_STREAM_URL;
+static volatile bool s_archive_mode = false;
+static volatile bool s_stream_ended = false;
+static void (*s_ended_cb)(void) = NULL;
+
+// ── ID3v2 ─────────────────────────────────────────────────────────────────────
+// Archive episodes begin with an ID3v2 tag, and it is not small: the first file
+// checked carried 2.1MB of it (embedded artwork). Those bytes are not MP3 frames,
+// and feeding them to the decoder makes the resync loop hunt for a sync word
+// through megabytes of tag and JPEG data — where it periodically finds a byte
+// pair that looks like a valid frame header and decodes noise. That is heard as
+// static, not silence, which is what made it look like a format problem.
+//
+// Live streams do not start with a tag, so this never showed up before.
+static bool s_id3_checked = false;
+// Byte offset to start the request at, so the tag is never transferred. Skipping
+// it on arrival still cost the whole download: 2.1MB took ~15s before the first
+// sample, which is most of a listener's patience.
+static uint32_t s_range_offset = 0;
+static uint32_t s_id3_skip = 0;
+
+/// Returns the total bytes to skip for a leading ID3v2 tag, or 0 if there is none.
+/// Needs at least 10 bytes.
+uint32_t radio_id3_tag_size(const uint8_t *b, size_t len) {
+  if (len < 10 || b[0] != 'I' || b[1] != 'D' || b[2] != '3') {
+    return 0;
+  }
+  // Size is four synchsafe bytes: 7 significant bits each, high bit always 0.
+  uint32_t size = ((uint32_t)(b[6] & 0x7F) << 21) |
+                  ((uint32_t)(b[7] & 0x7F) << 14) |
+                  ((uint32_t)(b[8] & 0x7F) << 7) | (uint32_t)(b[9] & 0x7F);
+  uint32_t total = 10 + size;
+  if (b[5] & 0x10) {
+    total += 10; // v2.4 footer
+  }
+  return total;
+}
 static uint32_t s_last_bytes_ms = 0;
 static uint32_t s_sample_rate = 0;
 
 // Defined in the coexistence section at the end of this file.
 static void radio_coex_init(void);
 static void radio_meta_task(void *arg);
+static void notify_ended(void);
 
 // The display leaves its "AirPlay Ready" standby screen only on
 // RTSP_EVENT_PLAYING, so the radio has to announce itself on the same event bus
@@ -143,7 +186,7 @@ static bool radio_connect(void) {
   radio_disconnect();
 
   esp_http_client_config_t cfg = {
-      .url = CONFIG_RADIO_STREAM_URL,
+      .url = s_url,
       .timeout_ms = 5000,
       .buffer_size = HTTP_READ_CHUNK,
       // Icecast responds to a plain GET with an unbounded body; we never expect
@@ -157,6 +200,12 @@ static bool radio_connect(void) {
     return false;
   }
 
+  char range[32];
+  if (s_range_offset > 0) {
+    snprintf(range, sizeof(range), "bytes=%lu-", (unsigned long)s_range_offset);
+    esp_http_client_set_header(s_client, "Range", range);
+  }
+
   esp_err_t err = esp_http_client_open(s_client, 0);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
@@ -167,13 +216,14 @@ static bool radio_connect(void) {
   // Must fetch headers before reading the body, or the first read returns them.
   int64_t len = esp_http_client_fetch_headers(s_client);
   int status = esp_http_client_get_status_code(s_client);
-  if (status != 200) {
+  // 206 Partial Content is the success case for a ranged request.
+  if (status != 200 && status != 206) {
     ESP_LOGW(TAG, "unexpected status %d", status);
     radio_disconnect();
     return false;
   }
 
-  ESP_LOGI(TAG, "connected: %s (status %d, len %lld)", CONFIG_RADIO_STREAM_URL,
+  ESP_LOGI(TAG, "connected: %s (status %d, len %lld)", s_url,
            status, (long long)len);
   s_connected = true;
   s_last_bytes_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -209,10 +259,51 @@ static void radio_fill_task(void *arg) {
 
     if (n > 0) {
       s_last_bytes_ms = now;
-      // Blocking send applies backpressure when the ring is full, which is the
-      // correct behaviour: the server paces us and we must not spin.
-      xStreamBufferSend(s_ring, chunk, (size_t)n, pdMS_TO_TICKS(200));
+
+      uint8_t *p = chunk;
+      size_t len = (size_t)n;
+
+      // Discard any leading ID3v2 tag here rather than in the decoder, so the
+      // ring holds audio and the prefill cushion means what it says.
+      if (!s_id3_checked && len >= 10) {
+        s_id3_skip = radio_id3_tag_size(chunk, len);
+        s_id3_checked = true;
+        if (s_id3_skip) {
+          ESP_LOGI(TAG, "skipping %lu byte ID3v2 tag",
+                   (unsigned long)s_id3_skip);
+        }
+      }
+      if (s_id3_skip > 0) {
+        uint32_t drop = s_id3_skip < len ? s_id3_skip : (uint32_t)len;
+        s_id3_skip -= drop;
+        p += drop;
+        len -= drop;
+      }
+
+      // Send EVERYTHING, retrying until it fits. The return value used to be
+      // ignored with a 200ms timeout, which silently discarded whatever did not
+      // fit — invisible on a live stream, because the server paces delivery and
+      // the ring rarely fills, but an archive episode arrives at megabytes per
+      // second and saturates the ring almost continuously. The dropped bytes were
+      // the glitching.
+      //
+      // Retrying in bounded steps rather than blocking forever keeps the task
+      // responsive to s_running, which radio_source_stop() waits on.
+      size_t sent = 0;
+      while (sent < len && s_running) {
+        sent += xStreamBufferSend(s_ring, p + sent, len - sent,
+                                  pdMS_TO_TICKS(100));
+      }
     } else if (n == 0) {
+      // An archive episode is finite: a complete body is the end of the show, not
+      // a stall to reconnect through. Stop reading but leave the ring alone — the
+      // drain task still has several seconds of audio to play out.
+      if (s_archive_mode && esp_http_client_is_complete_data_received(s_client)) {
+        ESP_LOGI(TAG, "episode complete — draining %u bytes",
+                 (unsigned)xStreamBufferBytesAvailable(s_ring));
+        s_stream_ended = true;
+        break;
+      }
       // No data this pass. Only a sustained silence means the flow is dead —
       // the reconnect happens on this task so nothing else can free s_client
       // underneath us.
@@ -226,6 +317,12 @@ static void radio_fill_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(10));
       }
     } else {
+      if (s_archive_mode) {
+        // Reconnecting mid-file would restart the episode from the top.
+        ESP_LOGW(TAG, "archive read error %d — ending episode", n);
+        s_stream_ended = true;
+        break;
+      }
       ESP_LOGW(TAG, "read error %d — reconnecting", n);
       s_reconnects++;
       radio_disconnect();
@@ -244,6 +341,18 @@ static void radio_fill_task(void *arg) {
   radio_disconnect();
   s_fill_task = NULL;
   vTaskDelete(NULL);
+}
+
+// Reported once the episode's audio has actually finished playing, not when its
+// download completed.
+//
+// The callback runs on the drain task, which radio_source_stop() waits for — so
+// it MUST NOT call stop(), start() or anything that does. Post to a queue and
+// return.
+static void notify_ended(void) {
+  if (s_archive_mode && s_stream_ended && s_ended_cb) {
+    s_ended_cb();
+  }
 }
 
 // ============================================================================
@@ -318,7 +427,14 @@ static void radio_drain_task(void *arg) {
         xStreamBufferReceive(s_ring, enc + held, want, pdMS_TO_TICKS(100));
     size_t avail = held + got;
     if (avail == 0) {
-      continue; // ring dry; loop and wait
+      // Ring dry. For a live stream that is just a pause in delivery; for an
+      // archive episode whose body already completed, it means the audio has all
+      // been played.
+      if (s_archive_mode && s_stream_ended) {
+        ESP_LOGI(TAG, "episode played out");
+        break;
+      }
+      continue;
     }
 
     esp_audio_dec_in_raw_t raw = {.buffer = enc, .len = (uint32_t)avail};
@@ -427,6 +543,7 @@ done:
   if (pcm) {
     heap_caps_free(pcm);
   }
+  notify_ended();
   s_drain_task = NULL;
   vTaskDelete(NULL);
 }
@@ -482,6 +599,9 @@ esp_err_t radio_source_start(void) {
   // the DAC should win.
   xTaskCreatePinnedToCore(radio_drain_task, "radio_drain", 4096, NULL, 6,
                           &s_drain_task, 0);
+  s_stream_ended = false;
+  s_id3_checked = false;
+  s_id3_skip = 0;
   xTaskCreatePinnedToCore(radio_fill_task, "radio_fill", 4096, NULL, 5,
                           &s_fill_task, 0);
   // Low priority: metadata must never compete with audio.
@@ -514,6 +634,28 @@ void radio_source_stop(void) {
 
 bool radio_source_is_playing(void) {
   return s_running;
+}
+
+void radio_source_set_ended_cb(void (*cb)(void)) { s_ended_cb = cb; }
+
+bool radio_source_is_archive(void) { return s_archive_mode; }
+
+esp_err_t radio_source_play_url(const char *url, bool archive,
+                                uint32_t start_offset) {
+  if (!url || !url[0]) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  radio_source_stop(); // releases I2S and waits for the tasks to exit
+  strlcpy(s_url, url, sizeof(s_url));
+  s_archive_mode = archive;
+  s_range_offset = start_offset;
+  ESP_LOGI(TAG, "play %s: %s (offset %lu)", archive ? "episode" : "stream",
+           s_url, (unsigned long)start_offset);
+  return radio_source_start();
+}
+
+esp_err_t radio_source_play_live(void) {
+  return radio_source_play_url(CONFIG_RADIO_STREAM_URL, false, 0);
 }
 
 uint32_t radio_source_reconnects(void) {
@@ -729,6 +871,17 @@ static void radio_meta_task(void *arg) {
   char last_title[128] = {0};
   char last_artist[128] = {0};
   uint32_t wait_ms = 0; // poll immediately on start
+
+  // An archive episode has its own metadata, published by archive.c. Polling the
+  // live now-playing API over it would label a recorded show with whatever the
+  // station happens to be broadcasting right now.
+  if (s_archive_mode) {
+    ESP_LOGI(TAG, "archive mode — now-playing poller idle");
+    heap_caps_free(buf);
+    s_meta_task = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
 
   // Announce before the first fetch so the screen stops claiming "AirPlay
   // Ready" the moment audio starts. The real track replaces this within a
