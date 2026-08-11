@@ -29,6 +29,7 @@ set( SRC_FILES
     "hap/hap_crypto.c"
     "hap/srp.c"
     "hap/tlv8.c"
+    "radio/radio_source.c"
     "network/wifi.c"
     "network/mdns_airplay.c"
     "network/ptp_clock.c"

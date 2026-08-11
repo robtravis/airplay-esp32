@@ -61,8 +61,10 @@ static const char *TAG = "display_st7789";
 // ============================================================================
 // Layout constants
 // ============================================================================
-#define X_MARGIN   22
-#define X_MARGIN_R (-22)
+// Margins match the radio firmware's DISPLAY_MARGIN of 8 (bezel inset) rather
+// than the stock 22, which wastes horizontal room on a 320px-wide panel.
+#define X_MARGIN   8
+#define X_MARGIN_R (-8)
 #define Y_TITLE    10
 #define Y_ARTIST   44
 #define Y_ALBUM    69
@@ -72,6 +74,23 @@ static const char *TAG = "display_st7789";
 #define Y_TIME     (Y_PROGRESS + 18)
 #define Y_STATUS   ((DISPLAY_HEIGHT >= 220) ? 188 : (DISPLAY_HEIGHT - 18))
 #define BAR_HEIGHT 12
+
+// ── Vibe Radio palette ─────────────────────────────────────────────────────────
+// Matches the radio firmware's brand colours so this device looks like the rest
+// of the family. RGB values are the hex comments from its config.h, converted
+// from the RGB565 constants it uses:
+//   C_CYAN        0x07FF  #00FFFF  primary — track title
+//   C_YELLOW      0xFFE0  #FFFF00  artist, and the lightning bolt
+//   C_MAGENTA     0xF81F  #FF00FF  accents, alerts
+//   C_MAGENTA_DIM 0x780F  #780080
+//   C_CYAN_DIM    0x0398  #007070  secondary text
+//   C_DARK_GREY   0x2104           dividers, progress trough
+#define VIBE_CYAN        lv_color_make(0x00, 0xFF, 0xFF)
+#define VIBE_CYAN_DIM    lv_color_make(0x00, 0x70, 0x70)
+#define VIBE_YELLOW      lv_color_make(0xFF, 0xFF, 0x00)
+#define VIBE_MAGENTA     lv_color_make(0xFF, 0x00, 0xFF)
+#define VIBE_MAGENTA_DIM lv_color_make(0x78, 0x00, 0x80)
+#define VIBE_DARK_GREY   lv_color_make(0x21, 0x21, 0x21)
 
 // ============================================================================
 // Display state
@@ -226,7 +245,7 @@ static void ui_create(void) {
   // Muted indicator — top-right corner, red, hidden by default
   s_label_muted = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_muted, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_label_muted, lv_color_make(255, 50, 50), 0);
+  lv_obj_set_style_text_color(s_label_muted, VIBE_MAGENTA, 0);
   lv_obj_align(s_label_muted, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_TITLE);
   lv_obj_add_flag(s_label_muted, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(s_label_muted, "MUTED");
@@ -240,7 +259,7 @@ static void ui_create(void) {
   lv_obj_set_width(s_label_title, DISPLAY_WIDTH - (X_MARGIN * 2));
   lv_label_set_long_mode(s_label_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_font(s_label_title, title_font, 0);
-  lv_obj_set_style_text_color(s_label_title, lv_color_white(), 0);
+  lv_obj_set_style_text_color(s_label_title, VIBE_CYAN, 0);
   lv_obj_align(s_label_title, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_TITLE);
   lv_label_set_text(s_label_title, "AirPlay Ready");
 
@@ -249,7 +268,7 @@ static void ui_create(void) {
   lv_obj_set_width(s_label_artist, DISPLAY_WIDTH - (X_MARGIN * 2));
   lv_label_set_long_mode(s_label_artist, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_font(s_label_artist, artist_font, 0);
-  lv_obj_set_style_text_color(s_label_artist, lv_color_make(180, 180, 180), 0);
+  lv_obj_set_style_text_color(s_label_artist, VIBE_YELLOW, 0);
   lv_obj_align(s_label_artist, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_ARTIST);
   lv_label_set_text(s_label_artist, "");
 
@@ -258,14 +277,14 @@ static void ui_create(void) {
   lv_obj_set_width(s_label_album, DISPLAY_WIDTH - (X_MARGIN * 2) - 60);
   lv_label_set_long_mode(s_label_album, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lv_obj_set_style_text_font(s_label_album, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_label_album, lv_color_make(140, 140, 140), 0);
+  lv_obj_set_style_text_color(s_label_album, VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_album, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_ALBUM);
   lv_label_set_text(s_label_album, "");
 
   // Paused status indicator — right side at album row, amber
   s_label_status = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_status, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_label_status, lv_color_make(255, 200, 0), 0);
+  lv_obj_set_style_text_color(s_label_status, VIBE_MAGENTA, 0);
   lv_obj_align(s_label_status, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_ALBUM);
   lv_label_set_text(s_label_status, "");
 
@@ -275,10 +294,9 @@ static void ui_create(void) {
   lv_obj_align(s_bar_progress, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_PROGRESS);
   lv_bar_set_range(s_bar_progress, 0, 100);
   lv_bar_set_value(s_bar_progress, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(s_bar_progress, lv_color_make(20, 20, 40), 0);
+  lv_obj_set_style_bg_color(s_bar_progress, VIBE_DARK_GREY, 0);
   lv_obj_set_style_bg_opa(s_bar_progress, LV_OPA_80, 0);
-  lv_obj_set_style_bg_color(s_bar_progress, lv_color_make(30, 144, 255),
-                            LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(s_bar_progress, VIBE_CYAN, LV_PART_INDICATOR);
   lv_obj_set_style_bg_opa(s_bar_progress, LV_OPA_COVER, LV_PART_INDICATOR);
   lv_obj_set_style_radius(s_bar_progress, 3, 0);
   lv_obj_set_style_radius(s_bar_progress, 3, LV_PART_INDICATOR);
@@ -287,7 +305,7 @@ static void ui_create(void) {
   s_label_time_elapsed = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_time_elapsed, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_label_time_elapsed,
-                              lv_color_make(150, 150, 150), 0);
+                              VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_time_elapsed, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_TIME);
   lv_label_set_text(s_label_time_elapsed, "");
 
@@ -295,21 +313,21 @@ static void ui_create(void) {
   s_label_time_remaining = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_time_remaining, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_label_time_remaining,
-                              lv_color_make(150, 150, 150), 0);
+                              VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_time_remaining, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_TIME);
   lv_label_set_text(s_label_time_remaining, "");
 
   // Volume — status row, bottom-left
   s_label_volume = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_volume, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_label_volume, lv_color_make(150, 150, 150), 0);
+  lv_obj_set_style_text_color(s_label_volume, VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_volume, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_STATUS);
   lv_label_set_text(s_label_volume, "");
 
   // Battery — status row, bottom-right
   s_label_battery = lv_label_create(scr);
   lv_obj_set_style_text_font(s_label_battery, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_label_battery, lv_color_make(150, 150, 150), 0);
+  lv_obj_set_style_text_color(s_label_battery, VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_battery, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_STATUS);
   lv_label_set_text(s_label_battery, "");
 }
@@ -360,7 +378,7 @@ static void ui_update_status_row(void) {
 
     // Tint red when low and not charging
     lv_color_t color = (!charging && pct <= 20) ? lv_color_make(255, 60, 60)
-                                                : lv_color_make(150, 150, 150);
+                                                : VIBE_CYAN_DIM;
     lv_obj_set_style_text_color(s_label_battery, color, 0);
   } else {
     lv_label_set_text(s_label_battery, "");
@@ -731,7 +749,18 @@ void display_init(void *bus) {
   // Rotation MUST be applied after lvgl_port_add_disp() — the port resets
   // the ST7789 MADCTL register during display registration.
   ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+#ifdef CONFIG_DISPLAY_FLIP
+  // 180° rotation: invert both mirror axes relative to the landscape default of
+  // (true, false). CONFIG_DISPLAY_FLIP was previously honoured only by the
+  // u8g2/OLED path (u8g2_SetFlipMode) and silently ignored here, so setting it
+  // had no effect on an ST7789.
+  //
+  // The Y gap needs no adjustment: 35 + 170 + 35 = 240, so the visible window is
+  // centred in the controller's 240 rows and is symmetric under mirroring.
+  ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, true));
+#else
   ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
+#endif
   ESP_ERROR_CHECK(esp_lcd_panel_set_gap(
       panel_handle, CONFIG_DISPLAY_ST7789_GAP_X, CONFIG_DISPLAY_ST7789_GAP_Y));
 

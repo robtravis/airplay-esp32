@@ -521,3 +521,48 @@ menu "Airplay ESP Configuration"
                 cycle the audio channel mode instead of play/pause.
     endmenu
 endmenu
+
+menu "Internet Radio Source"
+
+    config RADIO_ENABLED
+        bool "Enable HTTP internet-radio source"
+        default n
+        help
+            Play a fixed HTTP MP3 stream when no AirPlay session is active, so the
+            device is useful with no phone attached. Uses the MP3 decoder already
+            present in espressif/esp_audio_codec.
+
+    config RADIO_STREAM_URL
+        string "Stream URL"
+        default "http://viberadio.one/mobile.mp3"
+        depends on RADIO_ENABLED
+
+    config RADIO_RING_BYTES
+        int "Ring buffer size (bytes, PSRAM)"
+        default 131072
+        depends on RADIO_ENABLED
+        help
+            Compressed audio buffered between the socket and the decoder.
+            131072 is about 8 seconds at 128 kbps.
+
+    config RADIO_PREFILL_BYTES
+        int "Bytes to buffer before playback starts"
+        default 98304
+        depends on RADIO_ENABLED
+        help
+            THIS is the cushion, not the ring size. A live stream arrives at
+            real-time rate, so fill and drain run at equal speed and the ring
+            never accumulates on its own — whatever depth exists when draining
+            begins is the depth that persists. 98304 is about 6 seconds at
+            128 kbps, and playback starts that much later.
+
+    config RADIO_STALL_MS
+        int "Milliseconds of no data before reconnecting"
+        default 1500
+        depends on RADIO_ENABLED
+        help
+            A dead TCP flow reconnects instantly, so the delay before noticing is
+            the real cost. Keep this well above normal jitter but far below the
+            10s that a naive timeout would use.
+
+endmenu

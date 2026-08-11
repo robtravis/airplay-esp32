@@ -46,6 +46,28 @@ CONFIG_DISPLAY_ST7789_GAP_X=0
 CONFIG_DISPLAY_ST7789_GAP_Y=35
 CONFIG_DISPLAY_UPDATE_MS=500
 
+# Rotate 180° — the T-Embed's panel orientation puts the image upside down
+# relative to how the unit sits. Applied at the panel level (mirror/swap), so the
+# SPIFFS background image rotates with it rather than needing to be pre-flipped.
+CONFIG_DISPLAY_FLIP=y
+
+# ── Cover art ──────────────────────────────────────────────────────────────────
+# Off by default upstream, and the README is explicit that it is disabled "to
+# prevent audio pipeline stalls" — the same failure class that caused the radio's
+# dropouts on 2026-08-09, where a 43KB sprite push at 25Hz starved the audio pump.
+# Artwork is far larger than a sprite, so watch for it.
+#
+# HOW TO TELL: the audio_time "Playout:" lines report `gaps=` and `outliers=`.
+# Baseline with the display on and artwork off was gaps=0 and a static outlier
+# count. If gaps starts climbing after enabling this, artwork is the cause —
+# revert to n rather than trying to tune around it.
+# Turned back OFF: the ST7789 renderer has no artwork widget. ui_create() builds
+# labels, a progress bar and the background image — nothing that draws cover art.
+# So this option enables *reception* only, and nothing renders it. Displaying it
+# would need a JPEG decoder plus an LVGL image object, i.e. real work upstream.
+# Leaving it on costs the audio-stall risk the README warns about for no benefit.
+CONFIG_ENABLE_AIRPLAY_ARTWORK=n
+
 # display_st7789.c references montserrat 14/16/24, but LVGL only enables 14 by
 # default — without these the build fails with 'lv_font_montserrat_24 undeclared'.
 # Upstream CI builds esp32s3 with the display OFF, so this path does not compile
@@ -65,3 +87,13 @@ CONFIG_BOARD_POWER_ON_GPIO=46
 # ST7789 is supported (CONFIG_DISPLAY_DRIVER_ST7789) but needs its own pin set
 # plus PIN_POWER_ON (GPIO 46) held high to power the panel rail, which is a
 # separate piece of work.
+
+# ── Internet radio source ──────────────────────────────────────────────────────
+# Plays the Vibe Radio stream when no AirPlay session is active. MP3 decoding
+# comes from espressif/esp_audio_codec, which the project already depends on for
+# AAC/ALAC — no new dependency.
+CONFIG_RADIO_ENABLED=y
+CONFIG_RADIO_STREAM_URL="http://viberadio.one/mobile.mp3"
+CONFIG_RADIO_RING_BYTES=131072
+CONFIG_RADIO_PREFILL_BYTES=98304
+CONFIG_RADIO_STALL_MS=1500

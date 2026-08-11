@@ -10,6 +10,7 @@
 #include "mdns_airplay.h"
 #include "nvs_flash.h"
 #include "playback_control.h"
+#include "radio/radio_source.h"
 #include "ptp_clock.h"
 #include "rtsp_server.h"
 #include "settings.h"
@@ -76,6 +77,20 @@ static void start_airplay_services(void) {
   s_airplay_started = true;
   playback_control_set_source(PLAYBACK_SOURCE_AIRPLAY);
   ESP_LOGI(TAG, "AirPlay ready");
+
+#if CONFIG_RADIO_ENABLED
+  // Internet radio plays while nothing is AirPlaying, so the device is useful
+  // with no phone attached.
+  //
+  // NOTE: no arbitration yet. Right now the radio simply starts alongside, so an
+  // incoming AirPlay session will write to the same output and the two will fight.
+  // Suspend-on-session-start (modelled on bt_coex.c) is the next piece.
+  if (radio_source_init() == ESP_OK) {
+    radio_source_start();
+  } else {
+    ESP_LOGW(TAG, "radio source init failed — continuing without it");
+  }
+#endif
 }
 #ifdef CONFIG_BT_A2DP_ENABLE
 static void stop_airplay_services(void) {

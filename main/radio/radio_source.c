@@ -1,0 +1,403 @@
+/**
+ * @file radio_source.c
+ * @brief HTTP MP3 internet-radio source (see radio_source.h for design notes).
+ *
+ *   http ──[fill task]──▶ ring (PSRAM) ──[drain task]──▶ mp3 decode ──▶ I2S
+ */
+
+#include "radio_source.h"
+
+#include "audio_output.h"
+
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/task.h"
+
+#include "decoder/impl/esp_mp3_dec.h"
+
+#include <string.h>
+
+static const char *TAG = "radio";
+
+// Read chunk from the socket, and the working buffer the decoder consumes from.
+#define HTTP_READ_CHUNK 2048
+// One MP3 frame decodes to at most 1152 samples * 2ch * 2 bytes = 4608 bytes.
+// Double it for headroom against needed_size growth.
+#define PCM_BUF_BYTES 9216
+
+// The rate audio_output_init() brings I2S up at. Matching it means the radio
+// never has to retune the shared clock.
+#define AUDIO_OUTPUT_NATIVE_RATE 44100
+
+static StreamBufferHandle_t s_ring = NULL;
+static uint8_t *s_ring_storage = NULL;
+static StaticStreamBuffer_t s_ring_struct;
+
+static void *s_mp3 = NULL;
+static esp_http_client_handle_t s_client = NULL;
+
+static TaskHandle_t s_fill_task = NULL;
+static TaskHandle_t s_drain_task = NULL;
+static volatile bool s_running = false;
+static volatile bool s_connected = false;
+static uint32_t s_reconnects = 0;
+static uint32_t s_last_bytes_ms = 0;
+static uint32_t s_sample_rate = 0;
+
+// ============================================================================
+// Connection handling — owned entirely by the fill task
+// ============================================================================
+
+static void radio_disconnect(void) {
+  s_connected = false;
+  if (s_client) {
+    esp_http_client_close(s_client);
+    esp_http_client_cleanup(s_client);
+    s_client = NULL;
+  }
+}
+
+static bool radio_connect(void) {
+  radio_disconnect();
+
+  esp_http_client_config_t cfg = {
+      .url = CONFIG_RADIO_STREAM_URL,
+      .timeout_ms = 5000,
+      .buffer_size = HTTP_READ_CHUNK,
+      // Icecast responds to a plain GET with an unbounded body; we never expect
+      // it to end, so no redirect or content-length handling is needed.
+      .disable_auto_redirect = false,
+  };
+
+  s_client = esp_http_client_init(&cfg);
+  if (!s_client) {
+    ESP_LOGE(TAG, "http client init failed");
+    return false;
+  }
+
+  esp_err_t err = esp_http_client_open(s_client, 0);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
+    radio_disconnect();
+    return false;
+  }
+
+  // Must fetch headers before reading the body, or the first read returns them.
+  int64_t len = esp_http_client_fetch_headers(s_client);
+  int status = esp_http_client_get_status_code(s_client);
+  if (status != 200) {
+    ESP_LOGW(TAG, "unexpected status %d", status);
+    radio_disconnect();
+    return false;
+  }
+
+  ESP_LOGI(TAG, "connected: %s (status %d, len %lld)", CONFIG_RADIO_STREAM_URL,
+           status, (long long)len);
+  s_connected = true;
+  s_last_bytes_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  return true;
+}
+
+// ============================================================================
+// Fill task — socket -> ring. Reconnects itself.
+// ============================================================================
+
+static void radio_fill_task(void *arg) {
+  (void)arg;
+  uint8_t *chunk = heap_caps_malloc(HTTP_READ_CHUNK, MALLOC_CAP_DEFAULT);
+  if (!chunk) {
+    ESP_LOGE(TAG, "fill buffer alloc failed");
+    s_fill_task = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  uint32_t health_ms = 0;
+
+  while (s_running) {
+    if (!s_connected) {
+      if (!radio_connect()) {
+        vTaskDelay(pdMS_TO_TICKS(2000)); // back off before retrying
+        continue;
+      }
+    }
+
+    int n = esp_http_client_read(s_client, (char *)chunk, HTTP_READ_CHUNK);
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    if (n > 0) {
+      s_last_bytes_ms = now;
+      // Blocking send applies backpressure when the ring is full, which is the
+      // correct behaviour: the server paces us and we must not spin.
+      xStreamBufferSend(s_ring, chunk, (size_t)n, pdMS_TO_TICKS(200));
+    } else if (n == 0) {
+      // No data this pass. Only a sustained silence means the flow is dead —
+      // the reconnect happens on this task so nothing else can free s_client
+      // underneath us.
+      if (now - s_last_bytes_ms > CONFIG_RADIO_STALL_MS) {
+        ESP_LOGW(TAG, "flow dead %lums — reconnecting (ring=%u)",
+                 (unsigned long)(now - s_last_bytes_ms),
+                 (unsigned)xStreamBufferBytesAvailable(s_ring));
+        s_reconnects++;
+        radio_disconnect();
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(10));
+      }
+    } else {
+      ESP_LOGW(TAG, "read error %d — reconnecting", n);
+      s_reconnects++;
+      radio_disconnect();
+    }
+
+    if (now - health_ms >= 5000) {
+      health_ms = now;
+      ESP_LOGI(TAG, "ring=%u/%d rate=%lu reconnects=%lu",
+               (unsigned)xStreamBufferBytesAvailable(s_ring),
+               CONFIG_RADIO_RING_BYTES, (unsigned long)s_sample_rate,
+               (unsigned long)s_reconnects);
+    }
+  }
+
+  heap_caps_free(chunk);
+  radio_disconnect();
+  s_fill_task = NULL;
+  vTaskDelete(NULL);
+}
+
+// ============================================================================
+// Drain task — ring -> decode -> I2S
+// ============================================================================
+
+static void radio_drain_task(void *arg) {
+  (void)arg;
+  uint8_t *enc = heap_caps_malloc(HTTP_READ_CHUNK, MALLOC_CAP_DEFAULT);
+  uint8_t *pcm = heap_caps_malloc(PCM_BUF_BYTES, MALLOC_CAP_DEFAULT);
+  if (!enc || !pcm) {
+    ESP_LOGE(TAG, "decode buffer alloc failed");
+    goto done;
+  }
+
+  // Prefill. Without this the ring holds nothing: fill and drain both run at the
+  // stream's real-time rate, so the depth present when draining starts is the
+  // depth that persists.
+  {
+    uint32_t waited = 0;
+    while (s_running &&
+           xStreamBufferBytesAvailable(s_ring) < CONFIG_RADIO_PREFILL_BYTES) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      waited += 20;
+      if (waited > 15000) {
+        ESP_LOGW(TAG, "prefill timeout at %u bytes — starting anyway",
+                 (unsigned)xStreamBufferBytesAvailable(s_ring));
+        break;
+      }
+    }
+    if (s_running) {
+      ESP_LOGI(TAG, "primed %u bytes — playback starting",
+               (unsigned)xStreamBufferBytesAvailable(s_ring));
+    }
+  }
+
+  // NOTE: we deliberately do not call audio_output_start() or _stop() here, and
+  // do not touch the sample rate. main.c has already initialised I2S at 44100 Hz
+  // and started the playback task; audio_output_write() is simply the producer
+  // side of that. Every attempt to manage the output from here raced AirPlay's
+  // ownership of the same channel and produced
+  // "i2s_channel_write: The channel is not enabled" with garbled audio.
+  // See the rate-change comment in the decode loop below.
+
+  size_t held = 0;            // bytes carried over from a partial frame
+  uint32_t resync_bytes = 0;  // bytes skipped hunting for frame sync
+  uint32_t frames = 0;        // successfully decoded frames
+  while (s_running) {
+    size_t want = HTTP_READ_CHUNK - held;
+    size_t got =
+        xStreamBufferReceive(s_ring, enc + held, want, pdMS_TO_TICKS(100));
+    size_t avail = held + got;
+    if (avail == 0) {
+      continue; // ring dry; loop and wait
+    }
+
+    esp_audio_dec_in_raw_t raw = {.buffer = enc, .len = (uint32_t)avail};
+
+    while (raw.len > 0 && s_running) {
+      esp_audio_dec_out_frame_t frame = {.buffer = pcm, .len = PCM_BUF_BYTES};
+      esp_audio_dec_info_t info = {0};
+
+      esp_audio_err_t err = esp_mp3_dec_decode(s_mp3, &raw, &frame, &info);
+
+      if (err == ESP_AUDIO_ERR_DATA_LACK) {
+        // Partial frame at the end of the buffer — keep it and append more.
+        break;
+      }
+      if (err == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+        ESP_LOGW(TAG, "pcm buffer too small (needed %u, have %d)",
+                 (unsigned)frame.needed_size, PCM_BUF_BYTES);
+        break;
+      }
+      if (err != ESP_AUDIO_ERR_OK) {
+        // Corrupt or not yet frame-aligned. We join a live stream at an arbitrary
+        // offset, so the very first bytes are almost never a frame header.
+        //
+        // Skip one byte and look for the next sync word. Previously this branch
+        // just broke out and kept the whole buffer, so the same bad byte was
+        // retried forever: the decoder never advanced, logged
+        // "Not supported format", and eventually misread noise as a valid header
+        // (reporting 32000 Hz on a 44100 Hz stream). That was the garbling.
+        raw.buffer += 1;
+        raw.len -= 1;
+        resync_bytes++;
+        continue;
+      }
+
+      if (info.sample_rate && info.sample_rate != s_sample_rate) {
+        s_sample_rate = info.sample_rate;
+        ESP_LOGI(TAG, "stream format: %lu Hz, %d ch",
+                 (unsigned long)info.sample_rate, info.channel);
+
+        // Deliberately do NOT touch the output clock here.
+        //
+        // audio_output_init() already brings I2S up at 44100 Hz and enables the
+        // channel; audio_output_start() only spawns the writer task and does not
+        // enable anything. The playback task also has its own
+        // disable/enable underrun-recovery path. So calling
+        // audio_output_set_sample_rate() from here — even wrapped in stop/start —
+        // races AirPlay's management of a channel we share, which produced a
+        // stream of "i2s_channel_write: The channel is not enabled" and garbled
+        // audio. And it was pointless: the stream is 44100, which is exactly what
+        // I2S is already configured for.
+        //
+        // If a stream ever arrives at another rate we want to know rather than
+        // silently play it at the wrong pitch. Retuning safely needs proper
+        // ownership of the output, which is what the coex work will introduce.
+        if (info.sample_rate != AUDIO_OUTPUT_NATIVE_RATE) {
+          ESP_LOGW(TAG,
+                   "stream is %lu Hz but the output runs at %d Hz — pitch will "
+                   "be wrong; retuning needs output arbitration",
+                   (unsigned long)info.sample_rate, AUDIO_OUTPUT_NATIVE_RATE);
+        }
+      }
+
+      if (frame.decoded_size > 0) {
+        audio_output_write(pcm, frame.decoded_size, pdMS_TO_TICKS(200));
+      }
+
+      frames++;
+      if (raw.consumed == 0) {
+        // Decoder reported success without consuming input: force progress
+        // rather than spin on the same bytes.
+        raw.buffer += 1;
+        raw.len -= 1;
+      } else {
+        raw.buffer += raw.consumed;
+        raw.len -= raw.consumed;
+      }
+    }
+
+    // Carry the undecoded tail to the front for the next read.
+    if (frames > 0 && (frames % 400) == 0) {
+      ESP_LOGI(TAG, "decoded %lu frames, %lu bytes skipped resyncing",
+               (unsigned long)frames, (unsigned long)resync_bytes);
+    }
+
+    held = raw.len;
+    if (held > 0 && raw.buffer != enc) {
+      memmove(enc, raw.buffer, held);
+    }
+    if (held >= HTTP_READ_CHUNK) {
+      held = 0; // desynced beyond recovery; drop and resync on the next frame
+    }
+  }
+
+done:
+  if (enc) {
+    heap_caps_free(enc);
+  }
+  if (pcm) {
+    heap_caps_free(pcm);
+  }
+  s_drain_task = NULL;
+  vTaskDelete(NULL);
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+esp_err_t radio_source_init(void) {
+  if (s_ring) {
+    return ESP_OK;
+  }
+
+  // Ring storage in PSRAM; the FreeRTOS control struct stays in internal RAM.
+  s_ring_storage =
+      heap_caps_malloc(CONFIG_RADIO_RING_BYTES + 1, MALLOC_CAP_SPIRAM);
+  if (!s_ring_storage) {
+    ESP_LOGE(TAG, "failed to allocate %d byte ring in PSRAM",
+             CONFIG_RADIO_RING_BYTES);
+    return ESP_ERR_NO_MEM;
+  }
+  s_ring = xStreamBufferCreateStatic(CONFIG_RADIO_RING_BYTES, 1, s_ring_storage,
+                                     &s_ring_struct);
+  if (!s_ring) {
+    heap_caps_free(s_ring_storage);
+    s_ring_storage = NULL;
+    return ESP_ERR_NO_MEM;
+  }
+
+  if (esp_mp3_dec_open(NULL, 0, &s_mp3) != ESP_AUDIO_ERR_OK) {
+    ESP_LOGE(TAG, "mp3 decoder open failed");
+    return ESP_FAIL;
+  }
+
+  ESP_LOGI(TAG, "init: ring %d bytes (PSRAM), prefill %d bytes",
+           CONFIG_RADIO_RING_BYTES, CONFIG_RADIO_PREFILL_BYTES);
+  return ESP_OK;
+}
+
+esp_err_t radio_source_start(void) {
+  if (s_running) {
+    return ESP_OK;
+  }
+  if (!s_ring || !s_mp3) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  xStreamBufferReset(s_ring);
+  s_running = true;
+  s_sample_rate = 0;
+
+  // Drain at a higher priority than fill: if either must wait, the task feeding
+  // the DAC should win.
+  xTaskCreatePinnedToCore(radio_drain_task, "radio_drain", 4096, NULL, 6,
+                          &s_drain_task, 0);
+  xTaskCreatePinnedToCore(radio_fill_task, "radio_fill", 4096, NULL, 5,
+                          &s_fill_task, 0);
+  ESP_LOGI(TAG, "started");
+  return ESP_OK;
+}
+
+void radio_source_stop(void) {
+  if (!s_running) {
+    return;
+  }
+  s_running = false;
+  // Tasks observe s_running and exit on their own; wait briefly so the socket is
+  // closed and I2S released before a caller starts another source.
+  for (int i = 0; i < 50 && (s_fill_task || s_drain_task); i++) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  audio_output_stop();
+  ESP_LOGI(TAG, "stopped");
+}
+
+bool radio_source_is_playing(void) {
+  return s_running;
+}
+
+uint32_t radio_source_reconnects(void) {
+  return s_reconnects;
+}
