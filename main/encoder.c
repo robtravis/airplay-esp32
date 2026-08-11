@@ -176,7 +176,9 @@ esp_err_t encoder_init(void) {
   ESP_ERROR_CHECK(pcnt_unit_clear_count(s_unit));
   ESP_ERROR_CHECK(pcnt_unit_start(s_unit));
 
-  xTaskCreatePinnedToCore(encoder_task, "encoder", 3072, NULL, 3, NULL, 0);
+  // 6144, not 3072: this task drives the menu, which writes NVS (volume on every
+  // detent, LED effect and brightness on selection) and calls into the display.
+  xTaskCreatePinnedToCore(encoder_task, "encoder", 6144, NULL, 3, NULL, 0);
   ESP_LOGI(TAG, "rotary on GPIO %d/%d, button %d (long press %dms = menu)",
            CONFIG_ENCODER_A_GPIO, CONFIG_ENCODER_B_GPIO,
            CONFIG_ENCODER_BTN_GPIO, LONG_PRESS_MS);

@@ -76,7 +76,13 @@ void mdns_airplay_init(void) {
   ESP_ERROR_CHECK(mdns_init());
 
   // Set hostname
-  ESP_ERROR_CHECK(mdns_hostname_set(device_name));
+  // Sanitized, not the raw device name: "Vibe Radio" would advertise a hostname
+  // containing a space, so "vibe-radio.local" would not resolve. The display and
+  // the menu tell the user this name, so it has to be one that actually works.
+  char host[33] = "";
+  wifi_get_hostname(host, sizeof(host));
+  ESP_ERROR_CHECK(mdns_hostname_set(host[0] ? host : device_name));
+  ESP_LOGI(TAG, "mDNS hostname: %s.local", host[0] ? host : device_name);
 
 #ifndef CONFIG_AIRPLAY_FORCE_V1
   // ========================================

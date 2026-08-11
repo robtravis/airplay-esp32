@@ -1,3 +1,4 @@
+#include "esp_timer.h"
 #include "web_server.h"
 #include "led_ring.h"
 #if CONFIG_RADIO_ENABLED
@@ -250,6 +251,27 @@ static esp_err_t led_fx_post_handler(httpd_req_t *req) {
 }
 #endif
 
+// POST /api/wifi/forget — erase the stored network and reopen the setup AP.
+//
+// Without this there is no route back to provisioning once a network is saved:
+// the only recovery was reflashing or erasing NVS over USB, which is not
+// something a gift recipient can be walked through.
+static esp_err_t wifi_forget_handler(httpd_req_t *req) {
+  ESP_LOGW(TAG, "forget network requested");
+
+  // Answer before tearing the network down — the response cannot be delivered
+  // once the STA connection this request arrived over is gone.
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req,
+                     "{\"ok\":true,\"message\":\"Network forgotten. Join the "
+                     "setup network shown on the display.\"}");
+
+  // On its own task, so the response socket flushes first and the work is not
+  // squeezed into the HTTP task's stack.
+  wifi_forget_network_async();
+  return ESP_OK;
+}
+
 static esp_err_t captive_portal_redirect(httpd_req_t *req) {
   // Redirect to the configuration page
   httpd_resp_set_status(req, "302 Found");
@@ -335,11 +357,19 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
 
     esp_err_t err = settings_set_wifi_credentials(ssid, password);
     if (err == ESP_OK) {
-      cJSON_AddBoolToObject(response, "success", true);
-      ESP_LOGI(TAG, "WiFi credentials saved. We are restarting...");
-      // Schedule restart
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      esp_restart();
+      // Connect in place. This used to call esp_restart(), which on this board is
+      // a warm reset that does not boot: the credentials were saved and the
+      // device then went dark until it was physically unplugged, which reads as
+      // "setup did not work". Nobody can be walked through that.
+      esp_err_t cerr = wifi_connect_to(ssid, password);
+      cJSON_AddBoolToObject(response, "success", cerr == ESP_OK);
+      if (cerr == ESP_OK) {
+        cJSON_AddStringToObject(response, "message",
+                                "Connecting. The display will show the station "
+                                "once it joins.");
+      } else {
+        cJSON_AddStringToObject(response, "error", esp_err_to_name(cerr));
+      }
     } else {
       cJSON_AddBoolToObject(response, "success", false);
       cJSON_AddStringToObject(response, "error", esp_err_to_name(err));
@@ -1005,10 +1035,12 @@ static esp_err_t ota_update_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  // Send response before restarting
-  httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
-  vTaskDelay(pdMS_TO_TICKS(500));
-  esp_restart();
+  // Deliberately no esp_restart(): a warm reset does not boot this board, so
+  // "rebooting now" would strand the user at a dark device. The new image is
+  // already marked for the next boot, so a power cycle finishes the job — and
+  // the speaker keeps playing the old firmware until then.
+  httpd_resp_sendstr(req, "Firmware update complete. Unplug the speaker and "
+                          "plug it back in to finish.\n");
 
   return ESP_OK;
 }
@@ -1107,7 +1139,10 @@ static esp_err_t system_restart_handler(httpd_req_t *req) {
   free(json_str);
   cJSON_Delete(json);
 
-  ESP_LOGI(TAG, "Restart requested via web interface");
+  // Honoured because it was explicitly asked for, but note that on this board a
+  // warm reset does not boot: the device will go dark until it is unplugged.
+  ESP_LOGW(TAG, "Restart requested via web interface — this board needs a power "
+                "cycle to come back");
   vTaskDelay(pdMS_TO_TICKS(500));
   esp_restart();
 
@@ -1435,6 +1470,11 @@ esp_err_t web_server_start(uint16_t port) {
                                   .method = HTTP_POST,
                                   .handler = speedtest_upload_handler};
   httpd_register_uri_handler(s_server, &speedtest_ul_uri);
+
+  httpd_uri_t wifi_forget_uri = {.uri = "/api/wifi/forget",
+                                 .method = HTTP_POST,
+                                 .handler = wifi_forget_handler};
+  httpd_register_uri_handler(s_server, &wifi_forget_uri);
 
   httpd_uri_t wifi_scan_uri = {.uri = "/api/wifi/scan",
                                .method = HTTP_GET,

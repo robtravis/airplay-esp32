@@ -67,6 +67,7 @@ input:focus{outline:none;border-color:var(--accent)}
 <div class='form-group'><label>Network Name (SSID)</label><input type='text' id='wifi-ssid' placeholder='Enter or select network'></div>
 <div class='form-group'><label>Password</label><input type='password' id='wifi-pass' placeholder='Enter password'></div>
 <button class='btn btn-primary btn-block' onclick='saveWiFi()'>Connect to WiFi</button>
+<button class='btn btn-danger btn-block' onclick='forgetWiFi()'>Forget Network</button>
 <div id='wifi-msg'></div></div>
 <div class='card'><h2>Device Settings</h2>
 <div class='form-group'><label>AirPlay Device Name</label><input type='text' id='dev-name' placeholder='My Speaker'></div>
@@ -139,11 +140,26 @@ async function scanWiFi(){
       l.appendChild(i);});}
     else{l.innerHTML='<div class="msg info">No networks found</div>';}}
   catch(e){l.innerHTML='<div class="msg err">Scan failed</div>';}}
+function forgetWiFi(){
+  // Destructive and easy to hit by accident, so it confirms first and says what
+  // recovery looks like.
+  if(!confirm('Forget the saved WiFi network?\n\nThe speaker will reopen its own setup network. You will need to reconnect to that network to set it up again.')) return;
+  msg('wifi-msg','Forgetting network...','info');
+  fetch('/api/wifi/forget',{method:'POST'})
+    .then(r=>r.json())
+    .then(d=>{msg('wifi-msg',d.message||'Network forgotten.','ok');})
+    .catch(()=>{
+      // The connection drops by design once the STA link goes away, so a failed
+      // fetch here is the expected outcome rather than an error.
+      msg('wifi-msg','Network forgotten. Join the setup network shown on the display.','ok');
+    });
+}
+
 async function saveWiFi(){
   var s=document.getElementById('wifi-ssid').value.trim();var p=document.getElementById('wifi-pass').value;
   if(!s){msg('wifi-msg','Enter network name','err');return;}
   try{var r=await fetch('/api/wifi/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:s,password:p})});
-    var d=await r.json();if(d.success){msg('wifi-msg','Saved! Restarting...','ok');}else{msg('wifi-msg',d.error,'err');}}
+    var d=await r.json();if(d.success){msg('wifi-msg',d.message||'Connecting...','ok');}else{msg('wifi-msg',d.error,'err');}}
   catch(e){msg('wifi-msg','Error','err');}}
 async function loadBrightness(){
   try{var r=await fetch('/api/led/brightness');var d=await r.json();
@@ -216,7 +232,7 @@ async function startOTA(){
   try{await fetch('/api/ota/update',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});msg('ota-msg','Done! Rebooting...','ok');}
   catch(e){msg('ota-msg','Rebooting...','ok');}}
 async function restart(){
-  if(!confirm('Restart the device?'))return;
+  if(!confirm('Restart the device?\n\nNote: this speaker needs to be unplugged and plugged back in to come back on.'))return;
   try{await fetch('/api/system/restart',{method:'POST'});msg('','Restarting...','info');}catch(e){}}
 async function loadInfo(){
   try{var r=await fetch('/api/system/info');var d=await r.json();

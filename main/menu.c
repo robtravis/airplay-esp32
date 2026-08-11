@@ -7,6 +7,7 @@
 #include "led_ring.h"
 #include "playback_control.h"
 #include "settings.h"
+#include "wifi.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,8 @@ typedef enum {
   LEVEL_ARCHIVE_SHOWS,
   LEVEL_ARCHIVE_EPISODES,
   LEVEL_INFO,
+  LEVEL_NETWORK,
+  LEVEL_FORGET_CONFIRM,
 } menu_level_t;
 
 // Each row carries what it does, rather than the caller re-deriving it from the
@@ -45,6 +48,7 @@ typedef enum {
   ACT_OPEN_SHOW,
   ACT_PLAY_EPISODE,
   ACT_STOP_ARCHIVE,
+  ACT_FORGET_NETWORK,
 } action_t;
 
 // Must hold the whole archive show list plus "< BACK": 40 shows truncated at 16
@@ -109,6 +113,7 @@ static void build_and_draw(void) {
 #endif
     row_add(ACT_NONE, 0, "VOLUME: %d%%",
             playback_control_get_volume_percent());
+    row_add(ACT_OPEN_LEVEL, LEVEL_NETWORK, "NETWORK");
     row_add(ACT_OPEN_LEVEL, LEVEL_INFO, "INFO");
     break;
 
@@ -166,6 +171,32 @@ static void build_and_draw(void) {
     break;
 #endif
 
+  case LEVEL_NETWORK: {
+    snprintf(s_header, sizeof(s_header), "NETWORK");
+    row_add(ACT_BACK, 0, BACK_LABEL);
+    // The address, on the device itself. Telling someone to "find the IP" is not
+    // an instruction a gift recipient can follow.
+    char ip[24] = {0};
+    if (wifi_is_connected() && wifi_get_ip_str(ip, sizeof(ip)) == ESP_OK) {
+      row_add(ACT_NONE, 0, "%s", ip);
+      char host[33] = {0};
+      wifi_get_hostname(host, sizeof(host));
+      row_add(ACT_NONE, 0, "%s.local", host);
+    } else {
+      row_add(ACT_NONE, 0, "NOT CONNECTED");
+    }
+    row_add(ACT_OPEN_LEVEL, LEVEL_FORGET_CONFIRM, "FORGET NETWORK");
+    break;
+  }
+
+  case LEVEL_FORGET_CONFIRM:
+    // Two steps, because this is one click from a list people browse casually and
+    // it cannot be undone without re-entering the WiFi password.
+    snprintf(s_header, sizeof(s_header), "FORGET WIFI?");
+    row_add(ACT_BACK, 0, "NO, KEEP IT");
+    row_add(ACT_FORGET_NETWORK, 0, "YES, FORGET");
+    break;
+
   case LEVEL_INFO: {
     snprintf(s_header, sizeof(s_header), "INFO");
     row_add(ACT_BACK, 0, BACK_LABEL);
@@ -219,6 +250,9 @@ bool menu_is_open(void) { return s_level != LEVEL_NONE; }
 static void go_level(menu_level_t level) {
   s_level = level;
   s_sel = 1; // skip < BACK — nobody enters a list to leave it
+  if (level == LEVEL_FORGET_CONFIRM) {
+    s_sel = 0; // start on "NO, KEEP IT": a stray click must not wipe the network
+  }
 #ifdef CONFIG_RADIO_ENABLED
   if (level == LEVEL_ARCHIVE_SHOWS && !archive_is_ready() &&
       !archive_is_loading()) {
@@ -239,6 +273,9 @@ void menu_back_or_open(void) {
     break;
   case LEVEL_ARCHIVE_EPISODES:
     go_level(LEVEL_ARCHIVE_SHOWS); // back to the show list, not all the way out
+    break;
+  case LEVEL_FORGET_CONFIRM:
+    go_level(LEVEL_NETWORK);
     break;
   default:
     go_level(LEVEL_ROOT);
@@ -317,6 +354,16 @@ void menu_select(void) {
     s_level = LEVEL_NONE;
     break;
 #endif
+
+  case ACT_FORGET_NETWORK:
+    ESP_LOGW(TAG, "forget network confirmed from the device menu");
+    s_level = LEVEL_NONE; // the setup screen replaces the menu
+    build_and_draw();
+    MENU_UNLOCK();
+    // Async and outside the lock: it must not run on the encoder task (too
+    // little stack) nor with the menu mutex held.
+    wifi_forget_network_async();
+    return;
 
   case ACT_NONE:
   default:

@@ -38,6 +38,8 @@ static esp_timer_handle_t s_retry_timer = NULL;
 
 // Saved AP config from init, used to re-enable AP without duplication
 static wifi_config_t s_ap_config;
+// Kept so the menu can show the .local name without re-deriving it.
+static char s_hostname[DHCP_HOSTNAME_MAX_LEN + 1] = "";
 
 static void wifi_select_best_ap(const char *ssid);
 static void scan_and_connect_task(void *arg);
@@ -69,6 +71,7 @@ void wifi_set_hostname(const char *device_name) {
   }
   char hostname[DHCP_HOSTNAME_MAX_LEN + 1];
   sanitize_hostname(device_name, hostname, sizeof(hostname));
+  strlcpy(s_hostname, hostname, sizeof(s_hostname));
   esp_err_t err = esp_netif_set_hostname(s_sta_netif, hostname);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to set hostname '%s': %s", hostname,
@@ -110,6 +113,128 @@ static void enable_ap_mode(void) {
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &s_ap_config);
   }
+
+  // Say so on the screen. This function is only reached on failure paths —
+  // retries exhausted, or the network forgotten — which is exactly when the user
+  // needs to be told what to join.
+  //
+  // The AP_START handler cannot cover this: it gates on there being no stored
+  // credentials (because AP+STA both come up on every boot, and prompting then
+  // flashed setup instructions at an already-configured device). But a unit that
+  // HAS credentials and cannot reach that network is the case that matters most —
+  // a recipient whose WiFi changed — and it was showing "AirPlay Ready" while
+  // sitting unreachable in AP mode with no instructions at all.
+  char ip_str[24] = "192.168.4.1";
+  esp_netif_ip_info_t ip_info;
+  if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
+    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+  }
+  display_show_setup((const char *)s_ap_config.ap.ssid, ip_str);
+  led_ring_set_state(LED_RING_WIFI_PORTAL);
+}
+
+void wifi_get_hostname(char *out, size_t len) {
+  if (!out || len == 0) {
+    return;
+  }
+  // Fall back to the sanitized device name if the STA netif was not up when the
+  // hostname was set.
+  if (s_hostname[0]) {
+    strlcpy(out, s_hostname, len);
+    return;
+  }
+  char name[40] = {0};
+  if (settings_get_device_name(name, sizeof(name)) == ESP_OK) {
+    sanitize_hostname(name, out, len);
+  } else {
+    strlcpy(out, "esp32-airplay", len);
+  }
+}
+
+esp_err_t wifi_connect_to(const char *ssid, const char *password) {
+  if (!ssid || !ssid[0]) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  wifi_config_t cfg = {0};
+  strlcpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid));
+  if (password) {
+    strlcpy((char *)cfg.sta.password, password, sizeof(cfg.sta.password));
+  }
+  // Do not pin an auth mode: the scan result decides, and a wrong threshold
+  // silently refuses to associate with perfectly good APs.
+  cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+
+  // Start from a clean slate: a pending retry would fight this attempt.
+  s_retry_num = 0;
+  if (s_retry_timer) {
+    esp_timer_stop(s_retry_timer);
+  }
+
+  esp_wifi_disconnect();
+  esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "set_config failed: %s", esp_err_to_name(err));
+    return err;
+  }
+  ESP_LOGI(TAG, "connecting to '%s'", ssid); // never log the password
+  return esp_wifi_connect();
+}
+
+static void forget_task(void *arg) {
+  (void)arg;
+  wifi_forget_network();
+  vTaskDelete(NULL);
+}
+
+void wifi_forget_network_async(void) {
+  // Never run the forget on the caller's task. From the menu that caller is the
+  // encoder task, and this does an NVS erase and commit, several esp_wifi and
+  // esp_netif calls, and display work — far more than that task's stack holds.
+  // The observed symptom was no AP, no setup screen, and dead menus until a
+  // power cycle, which is exactly a wedged input task.
+  if (xTaskCreate(forget_task, "wifi_forget", 6144, NULL, 5, NULL) != pdPASS) {
+    ESP_LOGE(TAG, "could not start forget task");
+  }
+}
+
+void wifi_forget_network(void) {
+  ESP_LOGW(TAG, "forgetting stored network");
+
+  // Stop any pending reconnect first, or it will race the teardown and try to
+  // rejoin the network we are erasing.
+  if (s_retry_timer) {
+    esp_timer_stop(s_retry_timer);
+  }
+
+  settings_clear_wifi_credentials();
+
+  // Credentials live in two places: our NVS namespace above, and esp_wifi's own
+  // flash storage from esp_wifi_set_config(). Clearing only ours would leave the
+  // driver reconnecting to a network the UI says is forgotten.
+  wifi_config_t empty = {0};
+  esp_wifi_disconnect();
+  esp_wifi_set_config(WIFI_IF_STA, &empty);
+
+  s_sta_connected = false;
+  xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+  // Deliberately NO esp_restart(). A warm reset leaves these boards dark until
+  // they are physically unplugged, so rebooting here would look like the button
+  // bricked the device — the exact opposite of a recovery path. Bring the AP up
+  // in place instead.
+  enable_ap_mode();
+
+  char ip_str[24] = "192.168.4.1";
+  esp_netif_ip_info_t ip_info;
+  if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
+    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+  }
+  display_show_setup((const char *)s_ap_config.ap.ssid, ip_str);
+  led_ring_set_state(LED_RING_WIFI_PORTAL);
+
+  ESP_LOGW(TAG, "network forgotten — join %s and open %s",
+           (const char *)s_ap_config.ap.ssid, ip_str);
 }
 
 static void event_handler(void *arg, esp_event_base_t event_base,

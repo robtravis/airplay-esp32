@@ -89,6 +89,12 @@ esp_err_t settings_set_wifi_credentials(const char *ssid, const char *password);
  * Check if WiFi credentials are stored
  * @return true if credentials exist, false otherwise
  */
+/**
+ * Erase the stored WiFi credentials, returning the device to an unprovisioned
+ * state so the setup portal is reachable again.
+ */
+esp_err_t settings_clear_wifi_credentials(void);
+
 bool settings_has_wifi_credentials(void);
 
 /**

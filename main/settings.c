@@ -265,6 +265,29 @@ esp_err_t settings_set_wifi_credentials(const char *ssid,
   return err;
 }
 
+esp_err_t settings_clear_wifi_credentials(void) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    return err;
+  }
+  // Erase rather than store empty strings: settings_has_wifi_credentials() only
+  // checks whether the key reads back, so a blank SSID would still count as
+  // "provisioned" and the setup screen would never appear.
+  esp_err_t e1 = nvs_erase_key(nvs, NVS_KEY_WIFI_SSID);
+  esp_err_t e2 = nvs_erase_key(nvs, NVS_KEY_WIFI_PASSWORD);
+  nvs_commit(nvs);
+  nvs_close(nvs);
+  // NOT_FOUND simply means there was nothing stored.
+  if (e1 != ESP_OK && e1 != ESP_ERR_NVS_NOT_FOUND) {
+    return e1;
+  }
+  if (e2 != ESP_OK && e2 != ESP_ERR_NVS_NOT_FOUND) {
+    return e2;
+  }
+  return ESP_OK;
+}
+
 bool settings_has_wifi_credentials(void) {
   char ssid[MAX_WIFI_SSID_LEN + 1];
   return settings_get_wifi_ssid(ssid, sizeof(ssid)) == ESP_OK;
