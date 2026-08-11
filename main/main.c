@@ -79,14 +79,17 @@ static void start_airplay_services(void) {
   ESP_LOGI(TAG, "AirPlay ready");
 
 #if CONFIG_RADIO_ENABLED
-  // Internet radio plays while nothing is AirPlaying, so the device is useful
-  // with no phone attached.
+  // Internet radio plays on power-up so the device is useful with no phone.
   //
-  // NOTE: no arbitration yet. Right now the radio simply starts alongside, so an
-  // incoming AirPlay session will write to the same output and the two will fight.
-  // Suspend-on-session-start (modelled on bt_coex.c) is the next piece.
+  // Arbitration is by explicit mode (persisted in NVS, default radio), toggled via
+  // POST /api/source/mode. Only one source holds I2S at a time: the radio takes
+  // the channel with audio_output_stop() and returns it with audio_output_start().
+  // Without that exclusivity, AirPlay's playback task writes silence to the same
+  // channel and the two interleave into garbage.
   if (radio_source_init() == ESP_OK) {
-    radio_source_start();
+    // Honour the saved mode: radio by default, AirPlay if the user switched it in
+    // settings. Radio takes exclusive ownership of I2S when it starts.
+    radio_source_apply_saved_mode();
   } else {
     ESP_LOGW(TAG, "radio source init failed — continuing without it");
   }

@@ -8,6 +8,10 @@
 #include "radio_source.h"
 
 #include "audio_output.h"
+#include "settings.h"
+#include "rtsp_events.h"
+#include "esp_timer.h"
+#include "freertos/queue.h"
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -46,6 +50,9 @@ static volatile bool s_connected = false;
 static uint32_t s_reconnects = 0;
 static uint32_t s_last_bytes_ms = 0;
 static uint32_t s_sample_rate = 0;
+
+// Defined in the coexistence section at the end of this file.
+static void radio_coex_init(void);
 
 // ============================================================================
 // Connection handling — owned entirely by the fill task
@@ -421,4 +428,135 @@ bool radio_source_is_playing(void) {
 
 uint32_t radio_source_reconnects(void) {
   return s_reconnects;
+}
+
+// ============================================================================
+// Source mode
+// ============================================================================
+
+static uint8_t s_mode = SOURCE_MODE_RADIO;
+
+uint8_t radio_source_get_mode(void) {
+  return s_mode;
+}
+
+esp_err_t radio_source_set_mode(uint8_t mode) {
+  s_mode = mode ? SOURCE_MODE_AIRPLAY : SOURCE_MODE_RADIO;
+  settings_set_source_mode(s_mode);
+  ESP_LOGI(TAG, "source mode -> %s", s_mode ? "airplay" : "radio");
+
+  if (s_mode == SOURCE_MODE_RADIO) {
+    return radio_source_start(); // takes the I2S channel
+  }
+  radio_source_stop(); // returns the channel to AirPlay's playback task
+  return ESP_OK;
+}
+
+esp_err_t radio_source_apply_saved_mode(void) {
+  radio_coex_init();
+
+  uint8_t mode = SOURCE_MODE_RADIO;
+  if (settings_get_source_mode(&mode) != ESP_OK) {
+    mode = SOURCE_MODE_RADIO; // unset in NVS: radio is the default
+  }
+  s_mode = mode ? SOURCE_MODE_AIRPLAY : SOURCE_MODE_RADIO;
+  ESP_LOGI(TAG, "source mode at boot: %s", s_mode ? "airplay" : "radio");
+
+  if (s_mode == SOURCE_MODE_RADIO) {
+    return radio_source_start();
+  }
+  return ESP_OK; // AirPlay keeps the output it already started
+}
+
+// ============================================================================
+// AirPlay coexistence — automatic handover
+// ============================================================================
+//
+// Only one source may hold the I2S channel. An AirPlay session takes it; when the
+// session ends the radio takes it back after a short delay, so a brief reconnect
+// does not thrash the handover (the same reasoning bt_coex.c applies to the BT
+// radio).
+//
+// The work happens on a dedicated task because radio_source_stop() waits for the
+// fill and drain tasks to exit — blocking the RTSP callback or the esp_timer task
+// for that long would be a bug.
+
+#define COEX_TARGET_RADIO 0
+#define COEX_TARGET_YIELD 1
+#define COEX_RESUME_DELAY_US (3 * 1000 * 1000)
+
+static QueueHandle_t s_coex_q = NULL;
+static esp_timer_handle_t s_resume_timer = NULL;
+
+static void radio_coex_task(void *arg) {
+  (void)arg;
+  uint8_t target;
+  while (xQueueReceive(s_coex_q, &target, portMAX_DELAY) == pdTRUE) {
+    if (target == COEX_TARGET_RADIO) {
+      if (s_mode == SOURCE_MODE_RADIO && !s_running) {
+        ESP_LOGI(TAG, "AirPlay idle — resuming radio");
+        radio_source_start();
+      }
+    } else {
+      if (s_running) {
+        ESP_LOGI(TAG, "AirPlay session — yielding I2S");
+        radio_source_stop();
+      }
+    }
+  }
+}
+
+static void coex_post(uint8_t target) {
+  if (s_coex_q) {
+    xQueueSend(s_coex_q, &target, 0); // never block the caller
+  }
+}
+
+static void coex_resume_timer_cb(void *arg) {
+  (void)arg;
+  coex_post(COEX_TARGET_RADIO);
+}
+
+static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
+                          void *user_data) {
+  (void)data;
+  (void)user_data;
+  switch (event) {
+  case RTSP_EVENT_CLIENT_CONNECTED:
+  case RTSP_EVENT_PLAYING:
+    if (s_resume_timer) {
+      esp_timer_stop(s_resume_timer); // cancel any pending resume
+    }
+    coex_post(COEX_TARGET_YIELD);
+    break;
+  case RTSP_EVENT_PAUSED:
+    // Session is still open — stay yielded so the phone resumes into AirPlay
+    // rather than fighting the radio for the channel.
+    break;
+  case RTSP_EVENT_DISCONNECTED:
+    if (s_mode == SOURCE_MODE_RADIO && s_resume_timer) {
+      esp_timer_start_once(s_resume_timer, COEX_RESUME_DELAY_US);
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+static void radio_coex_init(void) {
+  if (s_coex_q) {
+    return;
+  }
+  s_coex_q = xQueueCreate(4, sizeof(uint8_t));
+  if (!s_coex_q) {
+    ESP_LOGE(TAG, "coex queue alloc failed — automatic handover disabled");
+    return;
+  }
+  const esp_timer_create_args_t targs = {.callback = coex_resume_timer_cb,
+                                         .name = "radio_resume"};
+  esp_timer_create(&targs, &s_resume_timer);
+  xTaskCreatePinnedToCore(radio_coex_task, "radio_coex", 3072, NULL, 4, NULL, 0);
+  rtsp_events_register(on_rtsp_event, NULL);
+  ESP_LOGI(TAG, "automatic AirPlay handover armed (resume delay %ds)",
+           COEX_RESUME_DELAY_US / 1000000);
 }

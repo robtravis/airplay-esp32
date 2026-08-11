@@ -18,6 +18,7 @@ static const char *TAG = "settings";
 #define NVS_KEY_EQ_GAINS       "eq_gains"
 #define NVS_KEY_LED_BRIGHTNESS "led_bright"
 #define NVS_KEY_CHANNEL_MODE   "chan_mode"
+#define NVS_KEY_SOURCE_MODE    "src_mode"
 #define NVS_KEY_SUB_OFFSET     "sub_off"
 #define NVS_KEY_SUB_XOVER      "sub_xo"
 #define NVS_KEY_SUB_EQ         "sub_eq"
@@ -800,6 +801,44 @@ settings_set_biamp_eq(const float gains_db[2][2][SETTINGS_WAY_BANDS]) {
     ESP_LOGI(TAG, "Saved bi-amp EQ gains");
   } else {
     ESP_LOGE(TAG, "Failed to save bi-amp EQ: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+esp_err_t settings_get_source_mode(uint8_t *mode) {
+  if (!mode) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+  if (err != ESP_OK) {
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  err = nvs_get_u8(nvs, NVS_KEY_SOURCE_MODE, mode);
+  nvs_close(nvs);
+  return err;
+}
+
+esp_err_t settings_set_source_mode(uint8_t mode) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = nvs_set_u8(nvs, NVS_KEY_SOURCE_MODE, mode);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "Saved source mode: %s", mode ? "airplay" : "radio");
+  } else {
+    ESP_LOGE(TAG, "Failed to save source mode: %s", esp_err_to_name(err));
   }
   return err;
 }

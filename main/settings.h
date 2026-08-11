@@ -54,7 +54,13 @@ esp_err_t settings_set_bt_volume(uint8_t volume);
  * Call once at session disconnect rather than on every change.
  */
 esp_err_t settings_persist_bt_volume(void);
+
 #endif
+
+/// Source mode: 0 = internet radio (default), 1 = AirPlay.
+/// Radio is the default so a unit plays the station on power-up with no phone.
+esp_err_t settings_get_source_mode(uint8_t *mode);
+esp_err_t settings_set_source_mode(uint8_t mode);
 
 /**
  * Get saved WiFi SSID

@@ -38,3 +38,22 @@ bool radio_source_is_playing(void);
 
 /// Reconnect count since boot — useful for spotting a flaky link.
 uint32_t radio_source_reconnects(void);
+
+// ── Source mode ────────────────────────────────────────────────────────────────
+// 0 = internet radio, 1 = AirPlay. Persisted in NVS, defaults to RADIO so a unit
+// plays the station on power-up with no phone involved.
+//
+// "AirPlay mode" simply means the radio is not holding the I2S channel: the radio
+// takes exclusive ownership when it starts (audio_output_stop) and returns it when
+// it stops (audio_output_start). AirPlay is advertised in both modes.
+#define SOURCE_MODE_RADIO   0
+#define SOURCE_MODE_AIRPLAY 1
+
+/// Read the saved mode and start the radio if that is what it says. Call at boot.
+esp_err_t radio_source_apply_saved_mode(void);
+
+/// Switch mode now and persist it.
+esp_err_t radio_source_set_mode(uint8_t mode);
+
+/// Current mode.
+uint8_t radio_source_get_mode(void);
