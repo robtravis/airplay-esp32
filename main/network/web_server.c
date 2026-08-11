@@ -1,4 +1,5 @@
 #include "web_server.h"
+#include "led_ring.h"
 #if CONFIG_RADIO_ENABLED
 #include "radio/radio_source.h"
 #endif
@@ -195,6 +196,60 @@ static esp_err_t speedtest_upload_handler(httpd_req_t *req) {
 
 // Captive portal detection handlers
 // These endpoints are requested by various OS to detect captive portals
+#ifdef CONFIG_LED_RING_ENABLE
+// GET /api/led/fx  -> {"fx":0,"count":8,"name":"BREATHE","names":[...]}
+// POST /api/led/fx -> {"fx":3}
+// Modelled on the existing /api/source/mode pair. The on-device menu is not
+// ported yet, so this is how the ring gets configured.
+static esp_err_t led_fx_get_handler(httpd_req_t *req) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddNumberToObject(root, "fx", led_ring_get_effect());
+  cJSON_AddNumberToObject(root, "scale", led_ring_get_scale());
+  cJSON_AddNumberToObject(root, "count", LED_FX_COUNT);
+  cJSON_AddStringToObject(root, "name",
+                          led_ring_effect_name(led_ring_get_effect()));
+  cJSON *names = cJSON_CreateArray();
+  for (int i = 0; i < LED_FX_COUNT; i++) {
+    cJSON_AddItemToArray(names, cJSON_CreateString(led_ring_effect_name(i)));
+  }
+  cJSON_AddItemToObject(root, "names", names);
+  char *out = cJSON_PrintUnformatted(root);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, out);
+  free(out);
+  cJSON_Delete(root);
+  return ESP_OK;
+}
+
+static esp_err_t led_fx_post_handler(httpd_req_t *req) {
+  char buf[64];
+  int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (len <= 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+    return ESP_FAIL;
+  }
+  buf[len] = 0;
+  cJSON *root = cJSON_Parse(buf);
+  cJSON *fx = root ? cJSON_GetObjectItem(root, "fx") : NULL;
+  cJSON *scale = root ? cJSON_GetObjectItem(root, "scale") : NULL;
+  if (!cJSON_IsNumber(fx) && !cJSON_IsNumber(scale)) {
+    cJSON_Delete(root);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fx or scale required");
+    return ESP_FAIL;
+  }
+  if (cJSON_IsNumber(fx)) {
+    led_ring_set_effect((int)fx->valuedouble);
+  }
+  if (cJSON_IsNumber(scale)) {
+    led_ring_set_scale((int)scale->valuedouble);
+  }
+  cJSON_Delete(root);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"ok\":true}");
+  return ESP_OK;
+}
+#endif
+
 static esp_err_t captive_portal_redirect(httpd_req_t *req) {
   // Redirect to the configuration page
   httpd_resp_set_status(req, "302 Found");
@@ -1494,6 +1549,18 @@ esp_err_t web_server_start(uint16_t port) {
 
   // Captive portal detection endpoints
   // Apple iOS/macOS
+#ifdef CONFIG_LED_RING_ENABLE
+  httpd_uri_t led_fx_get = {.uri = "/api/led/fx",
+                            .method = HTTP_GET,
+                            .handler = led_fx_get_handler};
+  httpd_register_uri_handler(s_server, &led_fx_get);
+
+  httpd_uri_t led_fx_post = {.uri = "/api/led/fx",
+                             .method = HTTP_POST,
+                             .handler = led_fx_post_handler};
+  httpd_register_uri_handler(s_server, &led_fx_post);
+#endif
+
   httpd_uri_t apple_captive1 = {.uri = "/hotspot-detect.html",
                                 .method = HTTP_GET,
                                 .handler = captive_apple_handler};

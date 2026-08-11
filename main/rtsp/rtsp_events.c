@@ -4,7 +4,10 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define MAX_LISTENERS 4
+// Was 4, which this build filled exactly (status LED, display, radio coex, LED
+// ring). rtsp_events_register() returns -1 when full and every caller in the
+// tree ignored it, so the fifth subscriber would simply never receive events.
+#define MAX_LISTENERS 8
 
 typedef struct {
   rtsp_event_callback_t callback;

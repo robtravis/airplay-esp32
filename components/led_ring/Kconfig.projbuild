@@ -1,0 +1,42 @@
+menu "LED Ring (APA102)"
+
+    config LED_RING_ENABLE
+        bool "Enable APA102 LED ring"
+        default n
+        help
+            Bit-banged APA102 ring, e.g. the 7 LEDs built into the LilyGO
+            T-Embed. Effects are selectable and persisted to NVS.
+
+    config LED_RING_DATA_GPIO
+        int "Data GPIO"
+        default 42
+        range 0 48
+        depends on LED_RING_ENABLE
+        help
+            T-Embed: 42.
+
+    config LED_RING_CLK_GPIO
+        int "Clock GPIO"
+        default 45
+        range 0 48
+        depends on LED_RING_ENABLE
+        help
+            T-Embed: 45.
+
+    config LED_RING_COUNT
+        int "Number of LEDs"
+        default 7
+        range 1 64
+        depends on LED_RING_ENABLE
+
+    config LED_RING_SCALE
+        int "Brightness scale (0-255)"
+        default 48
+        range 0 255
+        depends on LED_RING_ENABLE
+        help
+            Per-channel multiplier. The APA102 global brightness field is pinned
+            to its 1/31 minimum, so this is the real brightness control. 48 is
+            the radio's indoor/daylight value; 12 was too dim.
+
+endmenu
