@@ -1,0 +1,16 @@
+# ESP32-S3-DevKitC-1-N16R8 (third-party 4-pack) — test/iteration board
+#
+# Keeps every stock esp32s3 setting (this IS the board the project targets) and
+# changes only console routing.
+#
+# Why: this board has NO UART bridge chip. Both USB-C connectors present as
+# "Espressif Device" (native USB Serial/JTAG) — verified in ioreg, no CP210x /
+# CH34x / FTDI anywhere. So IDF's default UART0 console is unreachable here, the
+# same limitation as the T-Embed. Routing the console to USB Serial/JTAG gives us
+# every app-level log from cpu_start onward; the second-stage bootloader still
+# prints to UART0 and stays invisible.
+#
+# I2S pins deliberately left at the devkit defaults — no DAC is wired to this
+# board, so audio is not the objective. This is about seeing the boot sequence.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

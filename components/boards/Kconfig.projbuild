@@ -149,6 +149,16 @@ menu "Board Configuration"
         endmenu
 
         menu "Control GPIOs"
+            config BOARD_POWER_ON_GPIO
+                int "Board power-enable GPIO"
+                default -1
+                help
+                    GPIO that must be driven HIGH to enable the board's
+                    peripheral power rail (display, etc). Required on the LilyGO
+                    T-Embed S3, where GPIO 46 gates the panel supply — without it
+                    the TFT stays dark no matter how the display is configured.
+                    Set to -1 on boards that do not need it.
+
             config BAT_CHANNEL
                 int "Battery Monitor GPIO"
                 default -1

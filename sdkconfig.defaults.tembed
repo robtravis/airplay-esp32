@@ -1,0 +1,67 @@
+# LilyGO T-Embed ESP32-S3 — Rob's board
+#
+# Overrides on top of sdkconfig.defaults + sdkconfig.defaults.esp32s3.
+# Pin numbers taken from the radio firmware's config.h, which is known-good
+# against this hardware:
+#   PCM5102A: BCK->38, LCK/WS->40, DIN->41, FMT->GND, XSMT->3V3
+CONFIG_I2S_BCK_IO=38
+CONFIG_I2S_WS_IO=40
+CONFIG_I2S_DO_IO=41
+
+# PCM5102A generates its own clock from an internal PLL, so no MCLK is needed.
+# The devkit default was GPIO 8 — leave it undriven rather than assert a signal
+# onto a pin whose use on this board is owned by the display setup.
+CONFIG_I2S_SCK_IO=-1
+
+# This is a GPIO *driven low* as a ground reference (20mA max) for boards that
+# need it. This one has a real ground wire to the DAC, so disable it. The devkit
+# default was GPIO 14.
+CONFIG_I2S_GND_IO=-1
+
+# Route the console to the built-in USB Serial/JTAG peripheral. IDF defaults the
+# console to UART0 (GPIO 43/44), which is NOT wired to USB on this board — the
+# port enumerates from ROM so the device looks alive while printing nothing.
+# Same trap as needing CDCOnBoot=cdc on the Arduino side.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ── Display: ST7789 320x170 ─────────────────────────────────────────────────────
+# Pins taken from TFT_eSPI's Setup210_LilyGo_T_Embed_S3.h, which the radio
+# firmware uses and is therefore known-good against this panel.
+#
+# The Kconfig defaults already describe this exact panel (320x170, X gap 0,
+# Y gap 35) — the 35-row Y offset is what stops the image sitting off-screen on a
+# 170-tall ST7789.
+CONFIG_DISPLAY_ENABLED=y
+CONFIG_DISPLAY_DRIVER_ST7789=y
+CONFIG_DISPLAY_SPI_CLK=12
+CONFIG_DISPLAY_SPI_MOSI=11
+CONFIG_DISPLAY_SPI_CS=10
+CONFIG_DISPLAY_SPI_DC=13
+CONFIG_DISPLAY_SPI_RST=9
+CONFIG_DISPLAY_BL_GPIO=15
+CONFIG_DISPLAY_ST7789_WIDTH=320
+CONFIG_DISPLAY_ST7789_HEIGHT=170
+CONFIG_DISPLAY_ST7789_GAP_X=0
+CONFIG_DISPLAY_ST7789_GAP_Y=35
+CONFIG_DISPLAY_UPDATE_MS=500
+
+# display_st7789.c references montserrat 14/16/24, but LVGL only enables 14 by
+# default — without these the build fails with 'lv_font_montserrat_24 undeclared'.
+# Upstream CI builds esp32s3 with the display OFF, so this path does not compile
+# as shipped.
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+
+# GPIO 46 gates the peripheral power rail on this board — the panel stays dark
+# without it. See BOARD_POWER_ON_GPIO in components/boards/Kconfig.projbuild.
+CONFIG_BOARD_POWER_ON_GPIO=46
+
+# Note: the display SPI pins (MOSI 11, SCLK 12, DC 13) collide with the stock
+# esp32s3 I2S defaults (BCK 11, WS 13, DO 12). Our I2S override to 38/40/41 above
+# is what makes both work together — do not revert it.
+
+# Superseded: display was disabled for the first flash: prove audio in isolation. The T-Embed's
+# ST7789 is supported (CONFIG_DISPLAY_DRIVER_ST7789) but needs its own pin set
+# plus PIN_POWER_ON (GPIO 46) held high to power the panel rail, which is a
+# separate piece of work.

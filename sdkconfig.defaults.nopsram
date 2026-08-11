@@ -1,0 +1,17 @@
+# DIAGNOSTIC BUILD — PSRAM disabled. Not a shipping config.
+#
+# Both an ESP32-S3-DevKitC-1-N16R8 and a LilyGO T-Embed S3 flash a verified image
+# and then produce ZERO console output, while their USB Serial/JTAG stays
+# enumerated and stable (no reset loop). That peripheral enumerates from hardware
+# whether or not the CPU is running, so a chip halted in early boot presents
+# exactly this way — and second-stage bootloader failures print to UART0, which
+# neither board exposes over USB.
+#
+# The common factor across both boards is octal PSRAM at 80MHz. If disabling it
+# produces logs, PSRAM init is the blocker. The project needs PSRAM for real use
+# (mDNS and mbedTLS allocate from it), so this build may fail later — but any
+# output at all is the diagnostic win.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_SPIRAM=n

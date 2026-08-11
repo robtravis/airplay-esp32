@@ -44,6 +44,30 @@ static esp_err_t init_mute_gpio(void) {
 }
 #endif
 
+#if defined(CONFIG_BOARD_POWER_ON_GPIO) && CONFIG_BOARD_POWER_ON_GPIO >= 0
+// Some boards gate their peripheral power rail behind a GPIO. On the LilyGO
+// T-Embed S3 that is GPIO 46, and the TFT stays dark until it is driven high —
+// no display configuration can compensate. Asserted before anything else so the
+// rail is up before the display component initialises the panel.
+static esp_err_t init_power_on_gpio(void) {
+  gpio_config_t io_conf = {
+      .pin_bit_mask = (1ULL << CONFIG_BOARD_POWER_ON_GPIO),
+      .mode = GPIO_MODE_OUTPUT,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
+  };
+  esp_err_t err = gpio_config(&io_conf);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure power-on GPIO: %s", esp_err_to_name(err));
+    return err;
+  }
+  gpio_set_level(CONFIG_BOARD_POWER_ON_GPIO, 1);
+  ESP_LOGI(TAG, "Power-enable GPIO %d driven high", CONFIG_BOARD_POWER_ON_GPIO);
+  return ESP_OK;
+}
+#endif
+
 const char *iot_board_get_info(void) {
   return BOARD_NAME;
 }
@@ -62,6 +86,13 @@ esp_err_t iot_board_init(void) {
     ESP_LOGW(TAG, "Board already initialized");
     return ESP_OK;
   }
+
+#if defined(CONFIG_BOARD_POWER_ON_GPIO) && CONFIG_BOARD_POWER_ON_GPIO >= 0
+  esp_err_t pwr_err = init_power_on_gpio();
+  if (pwr_err != ESP_OK) {
+    return pwr_err;
+  }
+#endif
 
 #ifdef CONFIG_MUTE_GPIO
   esp_err_t err = init_mute_gpio();
