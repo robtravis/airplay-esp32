@@ -22,6 +22,9 @@
 #include "rtsp_events.h"
 #include "rtsp_server.h"
 #include "settings.h"
+#ifdef CONFIG_RADIO_ENABLED
+#include "radio/radio_source.h"
+#endif
 
 #include "esp_log.h"
 
@@ -37,7 +40,7 @@ static const char *TAG = "playback_ctrl";
 
 static playback_source_t s_source = PLAYBACK_SOURCE_NONE;
 static bool s_muted = false;
-static float s_pre_mute_db = -15.0f;
+static float s_pre_mute_db = 0.0f;
 
 esp_err_t playback_control_init(void) {
   dacp_init();
@@ -58,6 +61,14 @@ playback_source_t playback_control_get_source(void) {
 // ============================================================================
 // AirPlay local volume helpers
 // ============================================================================
+
+#ifdef CONFIG_RADIO_ENABLED
+// The radio is not a playback_source_t: it takes the output directly rather than
+// being selected, so s_source still reads AIRPLAY while it plays. Ask the radio.
+static bool radio_owns_output(void) { return radio_source_is_playing(); }
+#else
+static bool radio_owns_output(void) { return false; }
+#endif
 
 static float clamp_volume(float db) {
   if (db < VOLUME_MIN_DB) {
@@ -83,7 +94,7 @@ static float db_to_dacp_percent(float db) {
 static void airplay_adjust_volume(float step_db) {
   float current_db;
   if (settings_get_volume(&current_db) != ESP_OK) {
-    current_db = -15.0f; // default 50 %
+    current_db = 0.0f; // default 100 %
   }
 
   float new_db = clamp_volume(current_db + step_db);
@@ -108,6 +119,18 @@ static void airplay_adjust_volume(float step_db) {
 // ============================================================================
 
 void playback_control_play_pause(void) {
+#ifdef CONFIG_RADIO_ENABLED
+  if (radio_owns_output()) {
+    // Deliberately no rtsp_events_emit here. The AirPlay branch emits
+    // PAUSED/PLAYING, and the radio's coex handler used to read that PLAYING as
+    // an incoming AirPlay session and hand the channel away — pressing the
+    // button stopped the radio.
+    s_muted = !s_muted;
+    radio_source_set_muted(s_muted);
+    ESP_LOGI(TAG, "radio %s", s_muted ? "muted" : "unmuted");
+    return;
+  }
+#endif
   switch (s_source) {
   case PLAYBACK_SOURCE_AIRPLAY: {
     if (dacp_is_active()) {
@@ -123,7 +146,7 @@ void playback_control_play_pause(void) {
       // Fallback: mute/unmute the DAC locally when no DACP session
       if (!s_muted) {
         if (settings_get_volume(&s_pre_mute_db) != ESP_OK) {
-          s_pre_mute_db = -15.0f; // default 50 %
+          s_pre_mute_db = 0.0f; // default 100 %
         }
         dac_set_volume(VOLUME_MIN_DB);
         s_muted = true;
@@ -150,6 +173,20 @@ void playback_control_play_pause(void) {
 }
 
 void playback_control_volume_up(void) {
+#ifdef CONFIG_RADIO_ENABLED
+  if (radio_owns_output()) {
+    float db;
+    if (settings_get_volume(&db) != ESP_OK) {
+      db = 0.0f;
+    }
+    db = clamp_volume(db + VOLUME_STEP_DB);
+    settings_set_volume(db);
+    radio_source_set_volume_db(db);
+    ESP_LOGI(TAG, "radio volume %.1f dB (%d%%)", db,
+             playback_control_get_volume_percent());
+    return;
+  }
+#endif
   switch (s_source) {
   case PLAYBACK_SOURCE_AIRPLAY:
     airplay_adjust_volume(VOLUME_STEP_DB);
@@ -165,6 +202,20 @@ void playback_control_volume_up(void) {
 }
 
 void playback_control_volume_down(void) {
+#ifdef CONFIG_RADIO_ENABLED
+  if (radio_owns_output()) {
+    float db;
+    if (settings_get_volume(&db) != ESP_OK) {
+      db = 0.0f;
+    }
+    db = clamp_volume(db - VOLUME_STEP_DB);
+    settings_set_volume(db);
+    radio_source_set_volume_db(db);
+    ESP_LOGI(TAG, "radio volume %.1f dB (%d%%)", db,
+             playback_control_get_volume_percent());
+    return;
+  }
+#endif
   switch (s_source) {
   case PLAYBACK_SOURCE_AIRPLAY:
     airplay_adjust_volume(-VOLUME_STEP_DB);
@@ -212,11 +263,23 @@ void playback_control_prev(void) {
 }
 
 void playback_control_toggle_mute(void) {
+#ifdef CONFIG_RADIO_ENABLED
+  if (radio_owns_output()) {
+    // Deliberately no rtsp_events_emit here. The AirPlay branch emits
+    // PAUSED/PLAYING, and the radio's coex handler used to read that PLAYING as
+    // an incoming AirPlay session and hand the channel away — pressing the
+    // button stopped the radio.
+    s_muted = !s_muted;
+    radio_source_set_muted(s_muted);
+    ESP_LOGI(TAG, "radio %s", s_muted ? "muted" : "unmuted");
+    return;
+  }
+#endif
   switch (s_source) {
   case PLAYBACK_SOURCE_AIRPLAY:
     if (!s_muted) {
       if (settings_get_volume(&s_pre_mute_db) != ESP_OK) {
-        s_pre_mute_db = -15.0f; // default 50 %
+        s_pre_mute_db = 0.0f; // default 100 %
       }
       dac_set_volume(VOLUME_MIN_DB);
       s_muted = true;
@@ -251,7 +314,7 @@ int playback_control_get_volume_percent(void) {
   }
   float db;
   if (settings_get_volume(&db) != ESP_OK) {
-    db = -15.0f;
+    db = 0.0f;
   }
   return (int)(db_to_dacp_percent(clamp_volume(db)) + 0.5f);
 }

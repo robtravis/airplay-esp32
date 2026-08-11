@@ -32,7 +32,9 @@ static const char *TAG = "settings";
 #define MAX_DEVICE_NAME_LEN   64
 
 // Cached values  (defaults = 50 %)
-static float g_volume_db = -15.0f;
+// 0 dB = 100%. A radio that plays on power-up should be audible without anyone
+// touching a control; the encoder and the sender can both turn it down.
+static float g_volume_db = 0.0f;
 static bool g_volume_loaded = false;
 
 #ifdef CONFIG_BT_A2DP_ENABLE

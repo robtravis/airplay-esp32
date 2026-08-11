@@ -55,5 +55,15 @@ esp_err_t radio_source_apply_saved_mode(void);
 /// Switch mode now and persist it.
 esp_err_t radio_source_set_mode(uint8_t mode);
 
+// ── Volume ────────────────────────────────────────────────────────────────────
+// The radio writes to I2S directly, bypassing the playback task where
+// audio_output.c applies volume — so it scales its own samples.
+
+/// Set output gain from a dB value (the same scale settings_get_volume uses).
+void radio_source_set_volume_db(float db);
+
+/// Mute/unmute the radio path.
+void radio_source_set_muted(bool muted);
+
 /// Current mode.
 uint8_t radio_source_get_mode(void);

@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "freertos/queue.h"
 #include "cJSON.h"
+#include <math.h>
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -73,6 +74,50 @@ static volatile TaskHandle_t s_self_emit_task = NULL;
 // reason we stopped, its own events drive the screen and ours would blank a live
 // session.
 static volatile bool s_airplay_active = false;
+
+// ── Volume ────────────────────────────────────────────────────────────────────
+// audio_output.c applies volume inside its playback task (apply_volume), but the
+// radio owns I2S directly and never goes through that task — so without this the
+// encoder turned a control that did nothing to radio audio.
+//
+// Q15 fixed point, ramped toward the target rather than applied instantly: a
+// step change scales the signal by its current amplitude and clicks (the
+// "zipper" audio_output.c documents).
+#define GAIN_UNITY     32768
+#define GAIN_RAMP_STEP 32 // ~23ms for a full-scale change at 44.1kHz
+
+static volatile int32_t s_target_gain = GAIN_UNITY;
+static volatile bool s_muted = false;
+static int32_t s_cur_gain = GAIN_UNITY;
+
+void radio_source_set_volume_db(float db) {
+  float lin = powf(10.0f, db / 20.0f);
+  int32_t q = (int32_t)(lin * GAIN_UNITY);
+  s_target_gain = q < 0 ? 0 : (q > GAIN_UNITY ? GAIN_UNITY : q);
+}
+
+void radio_source_set_muted(bool muted) { s_muted = muted; }
+
+static void apply_gain(int16_t *buf, size_t samples) {
+  int32_t target = s_muted ? 0 : s_target_gain;
+  if (s_cur_gain == target && target == GAIN_UNITY) {
+    return; // unity and settled — leave the samples untouched
+  }
+  for (size_t i = 0; i < samples; i++) {
+    if (s_cur_gain < target) {
+      s_cur_gain += GAIN_RAMP_STEP;
+      if (s_cur_gain > target) {
+        s_cur_gain = target;
+      }
+    } else if (s_cur_gain > target) {
+      s_cur_gain -= GAIN_RAMP_STEP;
+      if (s_cur_gain < target) {
+        s_cur_gain = target;
+      }
+    }
+    buf[i] = (int16_t)(((int32_t)buf[i] * s_cur_gain) >> 15);
+  }
+}
 
 static void radio_emit(rtsp_event_t event, const rtsp_event_data_t *data) {
   s_self_emit_task = xTaskGetCurrentTaskHandle();
@@ -255,6 +300,14 @@ static void radio_drain_task(void *arg) {
   audio_output_stop();
   ESP_LOGI(TAG, "took I2S ownership (AirPlay playback task stopped)");
 
+  // Apply the persisted volume so the level survives a power cycle and matches
+  // what the screen reports.
+  float saved_db;
+  if (settings_get_volume(&saved_db) != ESP_OK) {
+    saved_db = 0.0f; // same default playback_control uses (100%)
+  }
+  radio_source_set_volume_db(saved_db);
+
   size_t held = 0;            // bytes carried over from a partial frame
   uint32_t resync_bytes = 0;  // bytes skipped hunting for frame sync
   uint32_t frames = 0;        // successfully decoded frames
@@ -331,7 +384,9 @@ static void radio_drain_task(void *arg) {
       if (frame.decoded_size > 0) {
         // portMAX_DELAY, as a2dp_sink does: real backpressure. A timeout here
         // silently discards audio and caps throughput below real time.
-        esp_err_t werr = audio_output_write(pcm, frame.decoded_size, portMAX_DELAY);
+        // 16-bit stereo interleaved, so decoded_size/2 samples.
+      apply_gain((int16_t *)pcm, frame.decoded_size / sizeof(int16_t));
+      esp_err_t werr = audio_output_write(pcm, frame.decoded_size, portMAX_DELAY);
         if (werr != ESP_OK) {
           write_errors++;
         }
@@ -562,10 +617,23 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
   (void)user_data;
   switch (event) {
   case RTSP_EVENT_CLIENT_CONNECTED:
-  case RTSP_EVENT_PLAYING:
     s_airplay_active = true;
     if (s_resume_timer) {
       esp_timer_stop(s_resume_timer); // cancel any pending resume
+    }
+    coex_post(COEX_TARGET_YIELD);
+    break;
+
+  case RTSP_EVENT_PLAYING:
+    // PLAYING alone does NOT mean a session started: playback_control emits it
+    // when a local mute is released, and treating that as an AirPlay takeover
+    // made the button stop the radio. Only a real client (CLIENT_CONNECTED)
+    // arms the yield.
+    if (!s_airplay_active) {
+      break;
+    }
+    if (s_resume_timer) {
+      esp_timer_stop(s_resume_timer);
     }
     coex_post(COEX_TARGET_YIELD);
     break;
@@ -667,7 +735,10 @@ static void radio_meta_task(void *arg) {
   // second, and it stays honest if the station's API is unreachable.
   {
     rtsp_event_data_t ev = {0};
-    strlcpy(ev.metadata.title, "Vibe Radio", sizeof(ev.metadata.title));
+    strlcpy(ev.metadata.title, CONFIG_RADIO_STATION_NAME,
+            sizeof(ev.metadata.title));
+    strlcpy(ev.metadata.station, CONFIG_RADIO_STATION_NAME,
+            sizeof(ev.metadata.station));
     radio_emit(RTSP_EVENT_METADATA, &ev);
     radio_emit(RTSP_EVENT_PLAYING, NULL);
   }
@@ -699,6 +770,11 @@ static void radio_meta_task(void *arg) {
       const cJSON *a = cJSON_GetObjectItem(song, "artist");
       const cJSON *al = cJSON_GetObjectItem(song, "album");
       const cJSON *dur = cJSON_GetObjectItem(np, "duration");
+      // Station identity comes from the API rather than a compile-time string,
+      // so a unit pointed at a different station labels itself correctly.
+      cJSON *st = cJSON_GetObjectItem(root, "station");
+      const cJSON *st_name = st ? cJSON_GetObjectItem(st, "name") : NULL;
+      const cJSON *playlist = cJSON_GetObjectItem(np, "playlist");
       const cJSON *ela = cJSON_GetObjectItem(np, "elapsed");
 
       const char *title = cJSON_IsString(t) ? t->valuestring : "";
@@ -720,7 +796,19 @@ static void radio_meta_task(void *arg) {
         ev.metadata.position_secs =
             cJSON_IsNumber(ela) ? (uint32_t)ela->valuedouble : 0;
 
-        ESP_LOGI(TAG, "now playing: %s - %s", artist, title);
+        // Masthead carries the station only. The show/playlist goes on the
+        // album row, where it reads as programme information rather than being
+        // crammed into the station line.
+        const char *st_txt = cJSON_IsString(st_name) && st_name->valuestring[0]
+                                 ? st_name->valuestring
+                                 : CONFIG_RADIO_STATION_NAME;
+        strlcpy(ev.metadata.station, st_txt, sizeof(ev.metadata.station));
+        if (cJSON_IsString(playlist) && playlist->valuestring[0]) {
+          strlcpy(ev.metadata.album, playlist->valuestring,
+                  sizeof(ev.metadata.album));
+        }
+
+        ESP_LOGI(TAG, "now playing: %s - %s [%s]", artist, title, st_txt);
         radio_emit(RTSP_EVENT_METADATA, &ev);
       }
     }
