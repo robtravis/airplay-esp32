@@ -99,3 +99,30 @@ CONFIG_RADIO_PREFILL_BYTES=98304
 CONFIG_RADIO_STALL_MS=1500
 CONFIG_RADIO_NOWPLAYING_URL="http://viberadio.one/api/nowplaying/vibe_radio"
 CONFIG_RADIO_NOWPLAYING_MS=15000
+CONFIG_RADIO_STATION_NAME="VIBE RADIO"
+
+# Type scale for the now-playing screen: 28pt title / 18pt artist / 14pt rest.
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# ── Physical controls ──────────────────────────────────────────────────────────
+# Rotary encoder: rotation = volume. Pins from the radio firmware's config.h.
+CONFIG_ENCODER_A_GPIO=2
+CONFIG_ENCODER_B_GPIO=1
+# The encoder's push-switch is GPIO 0, which is also the BOOT button. It is owned
+# by encoder.c rather than buttons.c, because the menu needs short vs long press
+# on the same pin and two owners would fight over it. BTN_PLAY_PAUSE stays -1.
+CONFIG_ENCODER_BTN_GPIO=0
+
+# Branding: AirPlay/mDNS speaker name comes from SETTINGS_DEFAULT_DEVICE_NAME
+# ("Vibe Radio"). The setup AP gets "Setup" appended so it is distinguishable
+# from the speaker itself in a WiFi list.
+CONFIG_DEFAULT_AP_SSID="Vibe Radio Setup"
+
+# ── APA102 LED ring ────────────────────────────────────────────────────────────
+# 7 LEDs built into the T-Embed. Pins and brightness from the radio's config.h.
+CONFIG_LED_RING_ENABLE=y
+CONFIG_LED_RING_DATA_GPIO=42
+CONFIG_LED_RING_CLK_GPIO=45
+CONFIG_LED_RING_COUNT=7
+CONFIG_LED_RING_SCALE=96

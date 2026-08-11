@@ -12,6 +12,8 @@
 #include "nvs_flash.h"
 
 #include "wifi.h"
+#include "display.h"
+#include "led_ring.h"
 #include "settings.h"
 
 static const char *TAG = "wifi";
@@ -155,8 +157,33 @@ static void event_handler(void *arg, esp_event_base_t event_base,
       ESP_LOGI(TAG, "STA connected, disabling AP mode");
       esp_wifi_set_mode(WIFI_MODE_STA);
     }
+    display_clear_setup();
+    // Only leave the portal look. Forcing OFF here killed whatever effect was
+    // already running, and got-IP fires again on every DHCP renewal.
+    if (led_ring_get_state() == LED_RING_WIFI_PORTAL) {
+      led_ring_set_state(LED_RING_OFF);
+    }
   } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
     ESP_LOGI(TAG, "AP started");
+    // Tell the user what to join. Read the address from the netif rather than
+    // hardcoding 192.168.4.1, so it stays correct if the AP subnet is changed.
+    char ip_str[24] = "192.168.4.1";
+    esp_netif_ip_info_t ip_info;
+    if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
+      snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+    }
+    // AP mode also comes up alongside STA on every boot, so AP_START alone does
+    // not mean "needs setup". Only prompt when there is no stored network to
+    // join — otherwise the screen flashed setup instructions on a device that
+    // was already provisioned.
+    wifi_config_t sta_cfg;
+    bool provisioned =
+        (esp_wifi_get_config(WIFI_IF_STA, &sta_cfg) == ESP_OK) &&
+        (strlen((char *)sta_cfg.sta.ssid) > 0);
+    if (!provisioned) {
+      display_show_setup((const char *)s_ap_config.ap.ssid, ip_str);
+      led_ring_set_state(LED_RING_WIFI_PORTAL);
+    }
   }
 }
 

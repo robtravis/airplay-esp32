@@ -1,6 +1,9 @@
 #include "audio_output.h"
 #include "audio_receiver.h"
 #include "buttons.h"
+#include "encoder.h"
+#include "menu.h"
+#include "led_ring.h"
 #include "spiram_task.h"
 #include "display.h"
 #include "dns_server.h"
@@ -90,6 +93,10 @@ static void start_airplay_services(void) {
     // Honour the saved mode: radio by default, AirPlay if the user switched it in
     // settings. Radio takes exclusive ownership of I2S when it starts.
     radio_source_apply_saved_mode();
+    // Do not rely on having received the one-shot PLAYING event — ask.
+    if (radio_source_is_playing()) {
+      led_ring_set_state(LED_RING_STREAMING);
+    }
   } else {
     ESP_LOGW(TAG, "radio source init failed — continuing without it");
   }
@@ -298,6 +305,10 @@ void app_main(void) {
 #else
   display_init(iot_board_get_handle(BOARD_I2C_DISP_ID));
 #endif
+  // Before any network callback can start playback: start_airplay_services()
+  // runs from WiFi-up and the radio emits PLAYING once, so registering late
+  // meant missing it and sitting in BOOT (a steady white ring) forever.
+  led_ring_init();
 
   // Initialize LVGL-dependent board resources (e.g., touch input) after
   // display/LVGL port is ready.
@@ -382,6 +393,8 @@ void app_main(void) {
            (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   buttons_init();
+  menu_init();
+  encoder_init();
 
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(10000));

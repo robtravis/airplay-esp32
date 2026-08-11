@@ -44,6 +44,19 @@
 
 static const char *TAG = "display_st7789";
 
+// Bitcount Single, converted from the OFL variable TTF in fonts/. A dot-matrix
+// face: it keeps the pixel character without unscii's weight, and it is narrower
+// than Silkscreen so a long track title fits before it has to scroll.
+//
+// Converted at 4bpp, not 1bpp: Bitcount's elements are round dots, and hard
+// on/off pixels square them off into exactly the blockiness it avoids.
+//
+// Symbol glyphs (the bolt) are outside the converted ASCII range, so the bolt
+// label alone stays on montserrat — it is an icon, not type.
+LV_FONT_DECLARE(bitcount_16);
+LV_FONT_DECLARE(bitcount_24);
+LV_FONT_DECLARE(bitcount_32);
+
 // ============================================================================
 // Hardware configuration
 // ============================================================================
@@ -65,9 +78,18 @@ static const char *TAG = "display_st7789";
 // than the stock 22, which wastes horizontal room on a 320px-wide panel.
 #define X_MARGIN   8
 #define X_MARGIN_R (-8)
-#define Y_TITLE    10
-#define Y_ARTIST   44
-#define Y_ALBUM    69
+// Station line sits at the very top as a masthead, with the track below it.
+// Row heights assume ~1.2x the font size: 14pt ~ 17px, 18pt ~ 22px, 28pt ~ 34px.
+#define Y_STATION  2
+// Width reserved for the bolt glyph plus its trailing space.
+#define BOLT_W     22
+#define MASTHEAD_H 20
+// Long enough to read, short enough not to delay a device whose whole point is
+// playing on power-up.
+#define SPLASH_MS  2500
+#define Y_TITLE    24
+#define Y_ARTIST   58
+#define Y_ALBUM    82
 // Keep the status controls on-screen for both the original 320x170 ST7789
 // layout and the Waveshare 240x240 panel.
 #define Y_PROGRESS ((DISPLAY_HEIGHT >= 220) ? 148 : 114)
@@ -91,13 +113,20 @@ static const char *TAG = "display_st7789";
 #define VIBE_MAGENTA     lv_color_make(0xFF, 0x00, 0xFF)
 #define VIBE_MAGENTA_DIM lv_color_make(0x78, 0x00, 0x80)
 #define VIBE_DARK_GREY   lv_color_make(0x21, 0x21, 0x21)
+// Mid tints: knocked back from full brightness but still clearly brighter than
+// the progress bar, which is VIBE_MAGENTA_DIM at 70% opacity.
+#define VIBE_CYAN_MID    lv_color_make(0x00, 0xC8, 0xC8)
+#define VIBE_YELLOW_MID  lv_color_make(0xC8, 0xC8, 0x00)
 
 // ============================================================================
 // Display state
 // ============================================================================
 
 typedef enum {
+  DISPLAY_STATE_SPLASH,
+  DISPLAY_STATE_MENU,
   DISPLAY_STATE_STANDBY,
+  DISPLAY_STATE_SETUP,
   DISPLAY_STATE_CONNECTED,
   DISPLAY_STATE_PLAYING,
   DISPLAY_STATE_PAUSED,
@@ -107,6 +136,9 @@ static struct {
   char title[METADATA_STRING_MAX];
   char artist[METADATA_STRING_MAX];
   char album[METADATA_STRING_MAX];
+  char station[METADATA_STRING_MAX];
+  char setup_ssid[METADATA_STRING_MAX];
+  char setup_ip[24];
   uint32_t duration_secs;
   uint32_t position_secs;
   display_state_t state;
@@ -137,6 +169,25 @@ static lv_obj_t *s_label_artist = NULL;
 static lv_obj_t *s_label_album = NULL;
 static lv_obj_t *s_label_muted = NULL;
 static lv_obj_t *s_label_status = NULL;
+static lv_obj_t *s_label_station = NULL;
+static lv_obj_t *s_label_bolt = NULL;
+// Splash widgets, centred and independent of the now-playing rows so the main
+// layout does not have to be re-aligned for two seconds of branding.
+static lv_obj_t *s_label_splash_1 = NULL;
+static lv_obj_t *s_label_splash_2 = NULL;
+static lv_obj_t *s_label_splash_3 = NULL;
+static int64_t s_splash_until_us = 0;
+
+// Menu widgets. A fixed set of row labels rather than lv_list: the rows never
+// change count, so recycling labels avoids allocating and freeing widgets on
+// every scroll tick.
+#define MENU_VISIBLE_ROWS 6
+#define MENU_ROW_H        18
+static lv_obj_t *s_menu_box = NULL;
+static lv_obj_t *s_menu_header = NULL;
+static lv_obj_t *s_menu_rows[MENU_VISIBLE_ROWS];
+// The masthead container has to be hidden while the menu is up, so keep a handle.
+static lv_obj_t *s_masthead = NULL;
 static lv_obj_t *s_bar_progress = NULL;
 static lv_obj_t *s_label_time_elapsed = NULL;
 static lv_obj_t *s_label_time_remaining = NULL;
@@ -244,17 +295,20 @@ static void ui_create(void) {
 
   // Muted indicator — top-right corner, red, hidden by default
   s_label_muted = lv_label_create(scr);
-  lv_obj_set_style_text_font(s_label_muted, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_label_muted, &bitcount_16, 0);
   lv_obj_set_style_text_color(s_label_muted, VIBE_MAGENTA, 0);
-  lv_obj_align(s_label_muted, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_TITLE);
+  lv_obj_align(s_label_muted, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_STATION);
   lv_obj_add_flag(s_label_muted, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(s_label_muted, "MUTED");
 
   // Title — largest font, white, scrolling
+  // Type scale. The 28/18/14 steps give the track title clear dominance at
+  // arm's length, which 24/16/14 did not. Long strings scroll, so a bigger
+  // title costs nothing but vertical space, and the rows above were reflowed
+  // for it. Requires CONFIG_LV_FONT_MONTSERRAT_18/_28.
   const lv_font_t *title_font =
-      (DISPLAY_HEIGHT >= 220) ? &lv_font_montserrat_14 : &lv_font_montserrat_24;
-  const lv_font_t *artist_font =
-      (DISPLAY_HEIGHT >= 220) ? &lv_font_montserrat_14 : &lv_font_montserrat_16;
+      (DISPLAY_HEIGHT >= 220) ? &bitcount_16 : &bitcount_32;
+  const lv_font_t *artist_font = &bitcount_24;
   s_label_title = lv_label_create(scr);
   lv_obj_set_width(s_label_title, DISPLAY_WIDTH - (X_MARGIN * 2));
   lv_label_set_long_mode(s_label_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -276,17 +330,69 @@ static void ui_create(void) {
   s_label_album = lv_label_create(scr);
   lv_obj_set_width(s_label_album, DISPLAY_WIDTH - (X_MARGIN * 2) - 60);
   lv_label_set_long_mode(s_label_album, LV_LABEL_LONG_SCROLL_CIRCULAR);
-  lv_obj_set_style_text_font(s_label_album, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_label_album, VIBE_CYAN_DIM, 0);
+  lv_obj_set_style_text_font(s_label_album, &bitcount_16, 0);
+  // Same brightness as the station masthead: for radio this row carries the
+  // show/playlist name, which is programme information rather than chrome.
+  lv_obj_set_style_text_color(s_label_album, VIBE_CYAN_MID, 0);
   lv_obj_align(s_label_album, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_ALBUM);
   lv_label_set_text(s_label_album, "");
 
   // Paused status indicator — right side at album row, amber
   s_label_status = lv_label_create(scr);
-  lv_obj_set_style_text_font(s_label_status, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_label_status, &bitcount_16, 0);
   lv_obj_set_style_text_color(s_label_status, VIBE_MAGENTA, 0);
   lv_obj_align(s_label_status, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_ALBUM);
   lv_label_set_text(s_label_status, "");
+
+  // Station masthead. The bolt is a separate label because LVGL 9 dropped
+  // lv_label_set_recolor — two colours in one line means two widgets (or a
+  // spangroup, which is heavier for a two-token string).
+  // Flex row so the bolt and the name centre together as a unit. Aligning each
+  // label separately cannot centre a two-colour line, and LVGL 9 dropped
+  // lv_label_set_recolor.
+  lv_obj_t *masthead = lv_obj_create(scr);
+  s_masthead = masthead;
+  lv_obj_remove_style_all(masthead);
+  lv_obj_set_size(masthead, DISPLAY_WIDTH, MASTHEAD_H);
+  lv_obj_align(masthead, LV_ALIGN_TOP_MID, 0, Y_STATION);
+  lv_obj_set_flex_flow(masthead, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(masthead, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(masthead, 6, 0);
+  lv_obj_clear_flag(masthead, LV_OBJ_FLAG_SCROLLABLE);
+
+  s_label_bolt = lv_label_create(masthead);
+  lv_obj_set_style_text_font(s_label_bolt, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_label_bolt, VIBE_YELLOW_MID, 0);
+  lv_label_set_text(s_label_bolt, "");
+
+  s_label_station = lv_label_create(masthead);
+  lv_obj_set_style_text_font(s_label_station, &bitcount_16, 0);
+  lv_obj_set_style_text_color(s_label_station, VIBE_CYAN_MID, 0);
+  lv_label_set_text(s_label_station, "");
+
+  // Boot splash — "VIBE" cyan over "RADIO" magenta with the URL beneath, the
+  // same arrangement the radio firmware's display_boot() drew.
+  s_label_splash_1 = lv_label_create(scr);
+  lv_obj_set_style_text_font(s_label_splash_1, &bitcount_32, 0);
+  lv_obj_set_style_text_color(s_label_splash_1, VIBE_CYAN, 0);
+  lv_obj_align(s_label_splash_1, LV_ALIGN_CENTER, 0, -28);
+  lv_label_set_text(s_label_splash_1, "VIBE");
+  lv_obj_add_flag(s_label_splash_1, LV_OBJ_FLAG_HIDDEN);
+
+  s_label_splash_2 = lv_label_create(scr);
+  lv_obj_set_style_text_font(s_label_splash_2, &bitcount_16, 0);
+  lv_obj_set_style_text_color(s_label_splash_2, VIBE_MAGENTA, 0);
+  lv_obj_align(s_label_splash_2, LV_ALIGN_CENTER, 0, 4);
+  lv_label_set_text(s_label_splash_2, "RADIO");
+  lv_obj_add_flag(s_label_splash_2, LV_OBJ_FLAG_HIDDEN);
+
+  s_label_splash_3 = lv_label_create(scr);
+  lv_obj_set_style_text_font(s_label_splash_3, &bitcount_16, 0);
+  lv_obj_set_style_text_color(s_label_splash_3, VIBE_CYAN_DIM, 0);
+  lv_obj_align(s_label_splash_3, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_label_set_text(s_label_splash_3, "viberadio.one");
+  lv_obj_add_flag(s_label_splash_3, LV_OBJ_FLAG_HIDDEN);
 
   // Progress bar — inset from border on both sides, rounded
   s_bar_progress = lv_bar_create(scr);
@@ -295,15 +401,18 @@ static void ui_create(void) {
   lv_bar_set_range(s_bar_progress, 0, 100);
   lv_bar_set_value(s_bar_progress, 0, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(s_bar_progress, VIBE_DARK_GREY, 0);
-  lv_obj_set_style_bg_opa(s_bar_progress, LV_OPA_80, 0);
-  lv_obj_set_style_bg_color(s_bar_progress, VIBE_CYAN, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_opa(s_bar_progress, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(s_bar_progress, LV_OPA_50, 0);
+  // Dim magenta at 70% rather than full cyan: the bar is a background detail and
+  // the bright cyan was pulling attention off the track title.
+  lv_obj_set_style_bg_color(s_bar_progress, VIBE_MAGENTA_DIM,
+                            LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(s_bar_progress, LV_OPA_70, LV_PART_INDICATOR);
   lv_obj_set_style_radius(s_bar_progress, 3, 0);
   lv_obj_set_style_radius(s_bar_progress, 3, LV_PART_INDICATOR);
 
   // Elapsed time — below bar, left aligned
   s_label_time_elapsed = lv_label_create(scr);
-  lv_obj_set_style_text_font(s_label_time_elapsed, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_label_time_elapsed, &bitcount_16, 0);
   lv_obj_set_style_text_color(s_label_time_elapsed,
                               VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_time_elapsed, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_TIME);
@@ -311,7 +420,7 @@ static void ui_create(void) {
 
   // Remaining time — below bar, right aligned
   s_label_time_remaining = lv_label_create(scr);
-  lv_obj_set_style_text_font(s_label_time_remaining, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_label_time_remaining, &bitcount_16, 0);
   lv_obj_set_style_text_color(s_label_time_remaining,
                               VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_time_remaining, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_TIME);
@@ -319,14 +428,45 @@ static void ui_create(void) {
 
   // Volume — status row, bottom-left
   s_label_volume = lv_label_create(scr);
-  lv_obj_set_style_text_font(s_label_volume, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_label_volume, &bitcount_16, 0);
   lv_obj_set_style_text_color(s_label_volume, VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_volume, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_STATUS);
   lv_label_set_text(s_label_volume, "");
 
+  // ── Menu ────────────────────────────────────────────────────────────────────
+  s_menu_box = lv_obj_create(scr);
+  lv_obj_remove_style_all(s_menu_box);
+  lv_obj_set_size(s_menu_box, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  lv_obj_align(s_menu_box, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(s_menu_box, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(s_menu_box, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(s_menu_box, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_menu_box, LV_OBJ_FLAG_HIDDEN);
+
+  s_menu_header = lv_label_create(s_menu_box);
+  lv_obj_set_style_text_font(s_menu_header, &bitcount_16, 0);
+  lv_obj_set_style_text_color(s_menu_header, VIBE_MAGENTA, 0);
+  lv_obj_align(s_menu_header, LV_ALIGN_TOP_LEFT, X_MARGIN, 4);
+  lv_label_set_text(s_menu_header, "MENU");
+
+  for (int i = 0; i < MENU_VISIBLE_ROWS; i++) {
+    s_menu_rows[i] = lv_label_create(s_menu_box);
+    lv_obj_set_width(s_menu_rows[i], DISPLAY_WIDTH - (X_MARGIN * 2));
+    lv_obj_set_style_text_font(s_menu_rows[i], &bitcount_16, 0);
+    lv_obj_set_style_text_color(s_menu_rows[i], VIBE_CYAN_DIM, 0);
+    // The highlight is a background on the selected row — cheaper than moving a
+    // cursor widget and it survives text of any width.
+    lv_obj_set_style_bg_color(s_menu_rows[i], VIBE_CYAN, 0);
+    lv_obj_set_style_bg_opa(s_menu_rows[i], LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_left(s_menu_rows[i], 2, 0);
+    lv_obj_align(s_menu_rows[i], LV_ALIGN_TOP_LEFT, X_MARGIN,
+                 26 + i * MENU_ROW_H);
+    lv_label_set_text(s_menu_rows[i], "");
+  }
+
   // Battery — status row, bottom-right
   s_label_battery = lv_label_create(scr);
-  lv_obj_set_style_text_font(s_label_battery, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(s_label_battery, &bitcount_16, 0);
   lv_obj_set_style_text_color(s_label_battery, VIBE_CYAN_DIM, 0);
   lv_obj_align(s_label_battery, LV_ALIGN_TOP_RIGHT, X_MARGIN_R, Y_STATUS);
   lv_label_set_text(s_label_battery, "");
@@ -397,6 +537,9 @@ static void ui_update(void) {
   char title[METADATA_STRING_MAX];
   char artist[METADATA_STRING_MAX];
   char album[METADATA_STRING_MAX];
+  char station[METADATA_STRING_MAX];
+  char setup_ssid[METADATA_STRING_MAX];
+  char setup_ip[24];
   uint32_t duration_secs;
   uint32_t position_secs;
   int64_t sync_time_us;
@@ -406,6 +549,9 @@ static void ui_update(void) {
   memcpy(title, s_display.title, sizeof(title));
   memcpy(artist, s_display.artist, sizeof(artist));
   memcpy(album, s_display.album, sizeof(album));
+  memcpy(station, s_display.station, sizeof(station));
+  memcpy(setup_ssid, s_display.setup_ssid, sizeof(setup_ssid));
+  memcpy(setup_ip, s_display.setup_ip, sizeof(setup_ip));
   duration_secs = s_display.duration_secs;
   position_secs = s_display.position_secs;
   sync_time_us = s_display.sync_time_us;
@@ -418,15 +564,51 @@ static void ui_update(void) {
   title[METADATA_STRING_MAX - 1] = '\0';
   artist[METADATA_STRING_MAX - 1] = '\0';
   album[METADATA_STRING_MAX - 1] = '\0';
+  station[METADATA_STRING_MAX - 1] = '\0';
+  setup_ssid[METADATA_STRING_MAX - 1] = '\0';
+  setup_ip[sizeof(setup_ip) - 1] = '\0';
 
   if (!lvgl_port_lock(100)) {
     ESP_LOGW(TAG, "ui_update: lock timeout");
     return;
   }
 
+  // The splash widgets overlay every other screen unless they are explicitly
+  // hidden: LVGL keeps them on the screen object regardless of state, and the
+  // per-state branches below only set text on the now-playing rows.
+  if (state != DISPLAY_STATE_SPLASH) {
+    lv_obj_add_flag(s_label_splash_1, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_label_splash_2, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_label_splash_3, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // The menu is a full-screen overlay, so everything else must go behind it.
+  if (s_menu_box) {
+    if (state == DISPLAY_STATE_MENU) {
+      lv_obj_clear_flag(s_menu_box, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(s_menu_box, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (s_masthead) {
+    if (state == DISPLAY_STATE_MENU) {
+      lv_obj_add_flag(s_masthead, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_clear_flag(s_masthead, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
   switch (state) {
+  case DISPLAY_STATE_MENU:
+    // Rows are written by display_menu_show(); nothing to do per-frame.
+    lv_obj_add_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_label_muted, LV_OBJ_FLAG_HIDDEN);
+    break;
+
   case DISPLAY_STATE_STANDBY:
     lv_label_set_text(s_label_title, "AirPlay Ready");
+    lv_obj_clear_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_label_station, "");
     lv_label_set_text(s_label_artist, "");
     lv_label_set_text(s_label_album, "");
     lv_label_set_text(s_label_status, "");
@@ -436,8 +618,39 @@ static void ui_update(void) {
     lv_obj_add_flag(s_label_muted, LV_OBJ_FLAG_HIDDEN);
     break;
 
+  case DISPLAY_STATE_SPLASH:
+    lv_obj_clear_flag(s_label_splash_1, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_label_splash_2, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_label_splash_3, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_label_bolt, "");
+    lv_label_set_text(s_label_station, "");
+    lv_label_set_text(s_label_title, "");
+    lv_label_set_text(s_label_artist, "");
+    lv_label_set_text(s_label_album, "");
+    lv_label_set_text(s_label_status, "");
+    lv_label_set_text(s_label_time_elapsed, "");
+    lv_label_set_text(s_label_time_remaining, "");
+    lv_obj_add_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_label_muted, LV_OBJ_FLAG_HIDDEN);
+    break;
+
+  case DISPLAY_STATE_SETUP:
+    lv_label_set_text(s_label_bolt, "");
+    lv_label_set_text(s_label_station, LV_SYMBOL_WIFI " WIFI SETUP");
+    lv_label_set_text(s_label_title, "Join WiFi");
+    lv_label_set_text(s_label_artist, setup_ssid);
+    lv_label_set_text_fmt(s_label_album, "then open %s", setup_ip);
+    lv_label_set_text(s_label_status, "");
+    lv_label_set_text(s_label_time_elapsed, "");
+    lv_label_set_text(s_label_time_remaining, "");
+    lv_obj_add_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_label_muted, LV_OBJ_FLAG_HIDDEN);
+    break;
+
   case DISPLAY_STATE_CONNECTED:
     lv_label_set_text(s_label_title, "Connected");
+    lv_obj_clear_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_label_station, "");
     lv_label_set_text(s_label_artist, "");
     lv_label_set_text(s_label_album, "");
     lv_label_set_text(s_label_status, "");
@@ -452,8 +665,13 @@ static void ui_update(void) {
     lv_label_set_text(s_label_title, title[0] ? title : "---");
     lv_label_set_text(s_label_artist, artist[0] ? artist : "");
     lv_label_set_text(s_label_album, album[0] ? album : "");
+    lv_obj_clear_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_label_status,
                       state == DISPLAY_STATE_PAUSED ? "|| " : "");
+    // LV_SYMBOL_CHARGE is the lightning bolt from LVGL's built-in symbol set,
+    // which ships inside the montserrat fonts — no extra font needed.
+    lv_label_set_text(s_label_bolt, station[0] ? LV_SYMBOL_CHARGE : "");
+    lv_label_set_text(s_label_station, station[0] ? station : "");
 
     // Muted indicator
     if (playback_control_is_muted()) {
@@ -514,6 +732,7 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
   switch (event) {
   case RTSP_EVENT_CLIENT_CONNECTED:
     s_display.state = DISPLAY_STATE_CONNECTED;
+    strlcpy(s_display.station, "AIRPLAY", sizeof(s_display.station));
     memset(s_display.title, 0, sizeof(s_display.title));
     memset(s_display.artist, 0, sizeof(s_display.artist));
     memset(s_display.album, 0, sizeof(s_display.album));
@@ -538,6 +757,7 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
 
   case RTSP_EVENT_DISCONNECTED:
     s_display.state = DISPLAY_STATE_STANDBY;
+    memset(s_display.station, 0, sizeof(s_display.station));
     memset(s_display.title, 0, sizeof(s_display.title));
     memset(s_display.artist, 0, sizeof(s_display.artist));
     memset(s_display.album, 0, sizeof(s_display.album));
@@ -563,6 +783,10 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
       if (data->metadata.album[0]) {
         memcpy(s_display.album, data->metadata.album, METADATA_STRING_MAX);
         s_display.album[METADATA_STRING_MAX - 1] = '\0';
+      }
+      if (data->metadata.station[0]) {
+        memcpy(s_display.station, data->metadata.station, METADATA_STRING_MAX);
+        s_display.station[METADATA_STRING_MAX - 1] = '\0';
       }
       if (data->metadata.duration_secs) {
         s_display.duration_secs = data->metadata.duration_secs;
@@ -590,6 +814,18 @@ static void display_task(void *pvParameters) {
   (void)pvParameters;
 
   while (1) {
+    // Leave the splash on time. A real event (playback, setup) replaces it
+    // earlier on its own — this only handles the quiet case.
+    if (s_splash_until_us && esp_timer_get_time() > s_splash_until_us) {
+      s_splash_until_us = 0;
+      STATE_LOCK();
+      if (s_display.state == DISPLAY_STATE_SPLASH) {
+        s_display.state = DISPLAY_STATE_STANDBY;
+        s_display.dirty = true;
+      }
+      STATE_UNLOCK();
+    }
+
     // Consume dirty under the state mutex so a concurrent set in the
     // RTSP callback is never lost (clear-after-set ordering).
     bool need_update = false;
@@ -633,6 +869,93 @@ static void display_task(void *pvParameters) {
 // ============================================================================
 // Initialization
 // ============================================================================
+
+void display_menu_show(const char *header, const char **items, int count,
+                       int sel) {
+  if (!s_state_mutex || !s_menu_box) {
+    return;
+  }
+  if (!lvgl_port_lock(100)) {
+    ESP_LOGW(TAG, "menu_show: lock timeout");
+    return;
+  }
+
+  // Window the list so the selection is always visible: scroll only once the
+  // cursor would leave the visible rows, which keeps the list still while
+  // moving within a page.
+  int first = 0;
+  if (count > MENU_VISIBLE_ROWS) {
+    first = sel - (MENU_VISIBLE_ROWS / 2);
+    if (first < 0) {
+      first = 0;
+    }
+    if (first > count - MENU_VISIBLE_ROWS) {
+      first = count - MENU_VISIBLE_ROWS;
+    }
+  }
+
+  lv_label_set_text(s_menu_header, header ? header : "MENU");
+  for (int row = 0; row < MENU_VISIBLE_ROWS; row++) {
+    int idx = first + row;
+    if (idx < count && items[idx]) {
+      lv_label_set_text(s_menu_rows[row], items[idx]);
+      bool on = (idx == sel);
+      lv_obj_set_style_text_color(s_menu_rows[row],
+                                  on ? lv_color_black() : VIBE_CYAN_DIM, 0);
+      lv_obj_set_style_bg_opa(s_menu_rows[row], on ? LV_OPA_COVER : LV_OPA_TRANSP,
+                              0);
+    } else {
+      lv_label_set_text(s_menu_rows[row], "");
+      lv_obj_set_style_bg_opa(s_menu_rows[row], LV_OPA_TRANSP, 0);
+    }
+  }
+  lvgl_port_unlock();
+
+  STATE_LOCK();
+  s_display.state = DISPLAY_STATE_MENU;
+  s_display.dirty = true;
+  STATE_UNLOCK();
+}
+
+void display_menu_hide(void) {
+  if (!s_state_mutex) {
+    return;
+  }
+  STATE_LOCK();
+  if (s_display.state == DISPLAY_STATE_MENU) {
+    // Back to the track screen if something is playing, else standby.
+    s_display.state =
+        s_display.title[0] ? DISPLAY_STATE_PLAYING : DISPLAY_STATE_STANDBY;
+    s_display.dirty = true;
+  }
+  STATE_UNLOCK();
+}
+
+void display_show_setup(const char *ssid, const char *ip) {
+  if (!s_state_mutex) {
+    return; // display not up yet
+  }
+  STATE_LOCK();
+  strlcpy(s_display.setup_ssid, ssid ? ssid : "",
+          sizeof(s_display.setup_ssid));
+  strlcpy(s_display.setup_ip, ip ? ip : "192.168.4.1",
+          sizeof(s_display.setup_ip));
+  s_display.state = DISPLAY_STATE_SETUP;
+  s_display.dirty = true;
+  STATE_UNLOCK();
+}
+
+void display_clear_setup(void) {
+  if (!s_state_mutex) {
+    return;
+  }
+  STATE_LOCK();
+  if (s_display.state == DISPLAY_STATE_SETUP) {
+    s_display.state = DISPLAY_STATE_STANDBY;
+    s_display.dirty = true;
+  }
+  STATE_UNLOCK();
+}
 
 void display_init(void *bus) {
   s_state_mutex = xSemaphoreCreateMutex();
@@ -781,7 +1104,10 @@ void display_init(void *bus) {
     gpio_set_level(CONFIG_DISPLAY_BL_GPIO, 1);
   }
 
-  s_display.state = DISPLAY_STATE_STANDBY;
+  // Boot into the splash. Any real event (playback starting, WiFi setup needed)
+  // replaces it immediately; otherwise display_task times it out.
+  s_display.state = DISPLAY_STATE_SPLASH;
+  s_splash_until_us = esp_timer_get_time() + (int64_t)SPLASH_MS * 1000;
   s_display.dirty = true;
 
   rtsp_events_register(on_rtsp_event, NULL);

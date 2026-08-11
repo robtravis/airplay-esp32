@@ -29,6 +29,10 @@ typedef struct {
                                     // artistName)
   char album[METADATA_STRING_MAX];  // Album name (DMAP asal / bplist albumName)
   char genre[METADATA_STRING_MAX];  // Genre (DMAP asgn)
+  // Station/source identity, e.g. "VIBE RADIO - Morning Vibes". AirPlay leaves
+  // this empty; a local source (internet radio) fills it so the screen always
+  // says where the audio is coming from.
+  char station[METADATA_STRING_MAX];
   uint32_t duration_secs;           // Total track duration in seconds
   uint32_t position_secs;           // Current playback position in seconds
   bool has_artwork;                 // Whether artwork is available

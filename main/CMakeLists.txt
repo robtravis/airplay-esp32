@@ -42,6 +42,8 @@ set( SRC_FILES
     "led.c"
     "audio/eq_events.c"
     "buttons.c"
+    "encoder.c"
+    "menu.c"
     "playback_control.c"
     "dacp_client.c"
 )

@@ -469,6 +469,33 @@ menu "Airplay ESP Configuration"
                 cabable of and want album art.
     endmenu
 
+    menu "Rotary Encoder"
+        config ENCODER_A_GPIO
+            int "Encoder phase A / CLK GPIO (-1 to disable)"
+            default -1
+            range -1 48
+            help
+                Rotation adjusts volume. Decoded by the PCNT peripheral, so a
+                turn is never missed while the audio tasks hold the CPU.
+                T-Embed: 2.
+
+        config ENCODER_BTN_GPIO
+            int "Encoder push-switch GPIO (-1 to disable)"
+            default -1
+            range -1 48
+            help
+                Short press = select (mute when no menu is open). Long press
+                opens the menu or steps back out. T-Embed: 0, which is also the
+                BOOT button.
+
+        config ENCODER_B_GPIO
+            int "Encoder phase B / DT GPIO"
+            default -1
+            range -1 48
+            help
+                T-Embed: 1.
+    endmenu
+
     menu "Button Configuration"
         config BTN_PLAY_PAUSE_GPIO
             int "Play/Pause button GPIO (-1 to disable)"
@@ -555,6 +582,14 @@ menu "Internet Radio Source"
             never accumulates on its own — whatever depth exists when draining
             begins is the depth that persists. 98304 is about 6 seconds at
             128 kbps, and playback starts that much later.
+
+    config RADIO_STATION_NAME
+        string "Station name shown on screen"
+        default "VIBE RADIO"
+        depends on RADIO_ENABLED
+        help
+            Fallback label for the station line. The name reported by the
+            now-playing API takes precedence when present.
 
     config RADIO_NOWPLAYING_URL
         string "Now-playing API URL"

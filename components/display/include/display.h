@@ -24,10 +24,63 @@
  */
 void display_init(void *bus);
 
+#ifdef CONFIG_DISPLAY_DRIVER_ST7789
+/**
+ * Show WiFi setup instructions: the AP name to join and the address to open.
+ *
+ * Without this the standby screen reads "AirPlay Ready" on a device that has no
+ * network and is waiting to be provisioned, which tells the user nothing about
+ * what to do. Declared only for the ST7789 renderer; the OLED path is
+ * unaffected.
+ */
+void display_show_setup(const char *ssid, const char *ip);
+
+/// Leave the setup screen (STA got an address).
+void display_clear_setup(void);
+
+/**
+ * Draw a menu list. The caller owns navigation and passes the full item list
+ * plus the selected index; the display windows it to the rows that fit, the way
+ * display_archive_list() did in the radio firmware.
+ */
+void display_menu_show(const char *header, const char **items, int count,
+                       int sel);
+
+/// Leave the menu and return to whatever was on screen before.
+void display_menu_hide(void);
+#else
+static inline void display_show_setup(const char *ssid, const char *ip) {
+  (void)ssid;
+  (void)ip;
+}
+static inline void display_clear_setup(void) {}
+static inline void display_menu_show(const char *header, const char **items,
+                                     int count, int sel) {
+  (void)header;
+  (void)items;
+  (void)count;
+  (void)sel;
+}
+static inline void display_menu_hide(void) {}
+#endif
+
 #else
 
 static inline void display_init(void *bus) {
   (void)bus;
 }
+static inline void display_show_setup(const char *ssid, const char *ip) {
+  (void)ssid;
+  (void)ip;
+}
+static inline void display_clear_setup(void) {}
+static inline void display_menu_show(const char *header, const char **items,
+                                     int count, int sel) {
+  (void)header;
+  (void)items;
+  (void)count;
+  (void)sel;
+}
+static inline void display_menu_hide(void) {}
 
 #endif
