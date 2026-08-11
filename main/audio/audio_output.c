@@ -1,4 +1,5 @@
 #include "audio_output.h"
+#include "audio_vis.h"
 #include "rtsp_server.h"
 
 #include "audio_resample.h"
@@ -153,6 +154,12 @@ static void playback_task(void *arg) {
       apply_volume(play_buf, play_samples * 2);
       apply_channel_mode(play_buf, play_samples);
       led_audio_feed(play_buf, play_samples);
+      // Feed the visualiser here as well as from the radio's decoder: AirPlay
+      // (and Bluetooth) never touch that path, so the analyser sat dead during an
+      // AirPlay session. This is the one place every non-radio source converges
+      // before I2S. Post-volume, matching the radio tap, so the bars follow what
+      // is audible. play_samples counts frames, so x2 for interleaved int16.
+      audio_vis_push(play_buf, play_samples * 2);
       i2s_channel_write(tx_handle, play_buf, play_samples * 2 * sizeof(int16_t),
                         &written, portMAX_DELAY);
       taskYIELD();

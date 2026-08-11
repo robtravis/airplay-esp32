@@ -147,9 +147,14 @@ static uint32_t rnd(uint32_t n) { return n ? (esp_random() % n) : 0; }
 
 static void render_streaming(void) {
   switch (s_fx) {
-  case LED_FX_BREATHE: { // cyan slow breathe
+  case LED_FX_BREATHE: { // slow breathe, hue drifting through the spectrum
     uint8_t b = breathe(4000);
-    fill(0, b, b);
+    // ~31s for a full lap of the colour wheel, against a 4s breath. Slow enough
+    // that it reads as the ring changing colour rather than as an animation —
+    // PULSE is the fast-hue version (7.7s lap on a 2s breath).
+    uint8_t hue = (uint8_t)((now_ms() / 120) & 0xFF);
+    rgb_t c = hsv(hue, 255, b);
+    fill(c.r, c.g, c.b);
     break;
   }
   case LED_FX_RAINBOW: { // hue sweeps around the ring

@@ -22,6 +22,7 @@
 #include "display.h"
 #include "audio_output.h"
 #include "board_common.h"
+#include "audio_vis.h"
 #include "playback_control.h"
 #include "rtsp_events.h"
 
@@ -118,6 +119,13 @@ LV_FONT_DECLARE(bitcount_32);
 #define VIBE_CYAN_MID    lv_color_make(0x00, 0xC8, 0xC8)
 #define VIBE_YELLOW_MID  lv_color_make(0xC8, 0xC8, 0x00)
 
+// Cyan through yellow to magenta across the spectrum — the Vibe palette read as a
+// ramp, so the bars belong to the same design as the text.
+#define VIS_COLOR(i)                                                           \
+  ((i) < VIS_BARS / 3 ? VIBE_CYAN                                              \
+                      : ((i) < (2 * VIS_BARS) / 3 ? VIBE_YELLOW_MID            \
+                                                  : VIBE_MAGENTA))
+
 // ============================================================================
 // Display state
 // ============================================================================
@@ -189,6 +197,55 @@ static lv_obj_t *s_menu_rows[MENU_VISIBLE_ROWS];
 // The masthead container has to be hidden while the menu is up, so keep a handle.
 static lv_obj_t *s_masthead = NULL;
 static lv_obj_t *s_bar_progress = NULL;
+
+// Visualiser: a dot matrix, to match Bitcount's dot-matrix type rather than
+// fight it. Individual objects rather than a canvas because LVGL repaints only
+// what changed — a dot that stays lit costs nothing, and there is no full-strip
+// blit. The original radio's stutter was a 43KB sprite push at 25Hz starving the
+// audio pump; here a typical frame touches a handful of 8x6 dots.
+//
+// Colour runs bottom to top by intensity — green, amber, red — which is the
+// convention every hi-fi spectrum analyser used, and what the reference units do.
+// Height alone tells you how loud a band is, independent of which band it is.
+#define VIS_COLS    AUDIO_VIS_BANDS
+// 15 fine dashes rather than 11 chunky dots: the reference display's segments are
+// thin horizontal bars in a dense grid, which is what makes it read as a
+// fluorescent panel instead of a row of LEDs. More rows also means more visible
+// movement for the same height.
+#define VIS_ROWS    13
+#define VIS_DOT_W   20 // of a 30px pitch, so columns are clearly separate
+#define VIS_DOT_H   3
+#define VIS_PITCH_Y 5 // 2px gaps: at 1px the segments merged into hatching
+#define VIS_H       (VIS_ROWS * VIS_PITCH_Y)
+// Sits on the bottom edge: the whole lower strip is the visualiser, and the
+// progress bar and time readouts hide while it is on rather than colliding.
+#define VIS_BOTTOM  (DISPLAY_HEIGHT - 1)
+#define VIS_TOP     (VIS_BOTTOM - VIS_H)
+
+static lv_obj_t *s_vis_dots[VIS_COLS][VIS_ROWS];
+static lv_obj_t *s_vis_peak[VIS_COLS];
+static bool s_vis_dot_lit[VIS_COLS][VIS_ROWS];
+static int s_vis_peak_row[VIS_COLS];
+static float s_vis_peak_f[VIS_COLS];
+static bool s_vis_enabled = false;
+
+static void vis_hide_displaced(bool hide);
+
+// Colour by height, in roughly even thirds so colour shows on ordinary material
+// rather than only on peaks. Expressed as rows counted DOWN FROM THE TOP, so the
+// proportions survive a change to VIS_ROWS.
+#define VIS_OVER_ROWS   4 // magenta: top 4 of 13
+#define VIS_YELLOW_ROWS 8 // yellow starts at row 5
+
+static inline lv_color_t vis_row_color(int row) {
+  if (row >= VIS_ROWS - VIS_OVER_ROWS) {
+    return VIBE_MAGENTA;
+  }
+  if (row >= VIS_ROWS - VIS_YELLOW_ROWS) {
+    return VIBE_YELLOW;
+  }
+  return VIBE_CYAN;
+}
 static lv_obj_t *s_label_time_elapsed = NULL;
 static lv_obj_t *s_label_time_remaining = NULL;
 static lv_obj_t *s_label_battery = NULL;
@@ -433,6 +490,57 @@ static void ui_create(void) {
   lv_obj_align(s_label_volume, LV_ALIGN_TOP_LEFT, X_MARGIN, Y_STATUS);
   lv_label_set_text(s_label_volume, "");
 
+  // ── Visualiser ──────────────────────────────────────────────────────────────
+  {
+    int total_w = DISPLAY_WIDTH - (X_MARGIN * 2);
+    int pitch_x = total_w / VIS_COLS;
+    int x0 = X_MARGIN + (pitch_x - VIS_DOT_W) / 2;
+    for (int c = 0; c < VIS_COLS; c++) {
+      for (int r = 0; r < VIS_ROWS; r++) {
+        lv_obj_t *d = lv_obj_create(scr);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_size(d, VIS_DOT_W, VIS_DOT_H);
+        // Row 0 is the bottom row, so level maps directly to rows lit upward.
+        lv_obj_align(d, LV_ALIGN_TOP_LEFT, x0 + c * pitch_x,
+                     VIS_BOTTOM - VIS_DOT_H - r * VIS_PITCH_Y);
+        lv_obj_set_style_bg_color(d, vis_row_color(r), 0);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+        // Square: a 3px dash with rounded ends turns into a blur. The grid reads
+        // as segments, which is the point.
+        lv_obj_set_style_radius(d, 0, 0);
+        // Bloom, for the look of a backlit panel rather than flat pixels. LVGL
+        // draws this as a blurred box shadow in the segment's own colour, so lit
+        // dashes bleed into each other the way phosphor or an LCD backlight does.
+        // Kept modest: shadow rendering is the expensive part of LVGL drawing, and
+        // there are 130 of these.
+        lv_obj_set_style_shadow_width(d, 6, 0);
+        lv_obj_set_style_shadow_color(d, vis_row_color(r), 0);
+        lv_obj_set_style_shadow_opa(d, LV_OPA_40, 0);
+        lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+        s_vis_dots[c][r] = d;
+        s_vis_dot_lit[c][r] = false;
+      }
+      // Peak marker: holds the recent maximum and falls slowly. Cheap, and it is
+      // what makes the display read as dynamics rather than a level meter.
+      lv_obj_t *pk = lv_obj_create(scr);
+      lv_obj_remove_style_all(pk);
+      lv_obj_set_size(pk, VIS_DOT_W, 1);
+      lv_obj_align(pk, LV_ALIGN_TOP_LEFT, x0 + c * pitch_x, VIS_TOP);
+      // Colour is set per-frame from the zone it lands in: a white dash hanging in
+      // empty space above a short column read as debris rather than a peak.
+      lv_obj_set_style_bg_color(pk, VIBE_CYAN, 0);
+      lv_obj_set_style_bg_opa(pk, LV_OPA_COVER, 0);
+      lv_obj_set_style_shadow_width(pk, 5, 0);
+      lv_obj_set_style_shadow_opa(pk, LV_OPA_40, 0);
+      lv_obj_add_flag(pk, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(pk, LV_OBJ_FLAG_SCROLLABLE);
+      s_vis_peak[c] = pk;
+      s_vis_peak_row[c] = -1;
+      s_vis_peak_f[c] = 0.0f;
+    }
+  }
+
   // ── Menu ────────────────────────────────────────────────────────────────────
   s_menu_box = lv_obj_create(scr);
   lv_obj_remove_style_all(s_menu_box);
@@ -607,7 +715,7 @@ static void ui_update(void) {
 
   case DISPLAY_STATE_STANDBY:
     lv_label_set_text(s_label_title, "AirPlay Ready");
-    lv_obj_clear_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    vis_hide_displaced(s_vis_enabled);
     lv_label_set_text(s_label_station, "");
     lv_label_set_text(s_label_artist, "");
     lv_label_set_text(s_label_album, "");
@@ -649,7 +757,7 @@ static void ui_update(void) {
 
   case DISPLAY_STATE_CONNECTED:
     lv_label_set_text(s_label_title, "Connected");
-    lv_obj_clear_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    vis_hide_displaced(s_vis_enabled);
     lv_label_set_text(s_label_station, "");
     lv_label_set_text(s_label_artist, "");
     lv_label_set_text(s_label_album, "");
@@ -665,7 +773,9 @@ static void ui_update(void) {
     lv_label_set_text(s_label_title, title[0] ? title : "---");
     lv_label_set_text(s_label_artist, artist[0] ? artist : "");
     lv_label_set_text(s_label_album, album[0] ? album : "");
-    lv_obj_clear_flag(s_bar_progress, LV_OBJ_FLAG_HIDDEN);
+    // The visualiser owns the bottom strip; the bar and readouts stay hidden
+    // while it is on rather than drawing through it.
+    vis_hide_displaced(s_vis_enabled);
     lv_label_set_text(s_label_status,
                       state == DISPLAY_STATE_PAUSED ? "|| " : "");
     // LV_SYMBOL_CHARGE is the lightning bolt from LVGL's built-in symbol set,
@@ -806,6 +916,105 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
   STATE_UNLOCK();
 }
 
+/// Redraw the matrix. Only dots whose state changed are touched, so a steady
+/// signal costs almost nothing and LVGL has almost no dirty area to flush.
+static void vis_update(void) {
+  uint8_t bands[VIS_COLS];
+  bool active = audio_vis_get_bands(bands, VIS_COLS);
+  if (!lvgl_port_lock(20)) {
+    return; // skip a frame rather than block the display task
+  }
+  for (int c = 0; c < VIS_COLS; c++) {
+    int lit = active ? (bands[c] * VIS_ROWS + 127) / 255 : 0;
+
+    for (int r = 0; r < VIS_ROWS; r++) {
+      bool want = r < lit;
+      if (want != s_vis_dot_lit[c][r]) {
+        s_vis_dot_lit[c][r] = want;
+        if (want) {
+          lv_obj_clear_flag(s_vis_dots[c][r], LV_OBJ_FLAG_HIDDEN);
+        } else {
+          lv_obj_add_flag(s_vis_dots[c][r], LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+    }
+
+    // Peak: jump up instantly, fall at a steady rate so it trails the music.
+    float lvl = (float)lit;
+    if (lvl > s_vis_peak_f[c]) {
+      s_vis_peak_f[c] = lvl;
+    } else {
+      // Falls nearly as fast as the columns do. At 0.12 the marker lagged several
+      // rows behind and hovered detached from its column.
+      s_vis_peak_f[c] -= 0.30f;
+      if (s_vis_peak_f[c] < 0.0f) {
+        s_vis_peak_f[c] = 0.0f;
+      }
+    }
+    int prow = (int)s_vis_peak_f[c] - 1;
+    if (prow >= VIS_ROWS) {
+      prow = VIS_ROWS - 1;
+    }
+    if (prow != s_vis_peak_row[c]) {
+      s_vis_peak_row[c] = prow;
+      if (prow < 1) {
+        lv_obj_add_flag(s_vis_peak[c], LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_obj_clear_flag(s_vis_peak[c], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(s_vis_peak[c], vis_row_color(prow), 0);
+        lv_obj_set_style_shadow_color(s_vis_peak[c], vis_row_color(prow), 0);
+        lv_obj_set_y(s_vis_peak[c],
+                     VIS_BOTTOM - VIS_DOT_H - prow * VIS_PITCH_Y - 2);
+      }
+    }
+  }
+  lvgl_port_unlock();
+}
+
+/// Widgets the visualiser displaces. The bottom strip is shared, so these hide
+/// while it runs instead of drawing through it.
+static void vis_hide_displaced(bool hide) {
+  lv_obj_t *displaced[] = {s_bar_progress, s_label_time_elapsed,
+                           s_label_time_remaining, s_label_volume,
+                           s_label_battery};
+  for (size_t i = 0; i < sizeof(displaced) / sizeof(displaced[0]); i++) {
+    if (!displaced[i]) {
+      continue;
+    }
+    if (hide) {
+      lv_obj_add_flag(displaced[i], LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_clear_flag(displaced[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+void display_set_visualizer(bool enabled) {
+  if (!s_state_mutex) {
+    return;
+  }
+  s_vis_enabled = enabled;
+  if (!lvgl_port_lock(100)) {
+    return;
+  }
+  for (int c = 0; c < VIS_COLS; c++) {
+    for (int r = 0; r < VIS_ROWS; r++) {
+      lv_obj_add_flag(s_vis_dots[c][r], LV_OBJ_FLAG_HIDDEN);
+      s_vis_dot_lit[c][r] = false;
+    }
+    lv_obj_add_flag(s_vis_peak[c], LV_OBJ_FLAG_HIDDEN);
+    s_vis_peak_row[c] = -1;
+    s_vis_peak_f[c] = 0.0f;
+  }
+  vis_hide_displaced(enabled);
+  lvgl_port_unlock();
+  STATE_LOCK();
+  s_display.dirty = true;
+  STATE_UNLOCK();
+}
+
+bool display_get_visualizer(void) { return s_vis_enabled; }
+
 // ============================================================================
 // Display task
 // ============================================================================
@@ -840,6 +1049,16 @@ static void display_task(void *pvParameters) {
 
     if (need_update) {
       ui_update();
+    }
+
+    // Visualiser frames. 50ms (20fps) reads as motion without the SPI traffic of
+    // a full redraw: only bars that changed height are repainted.
+    static TickType_t last_vis = 0;
+    TickType_t vnow = xTaskGetTickCount();
+    if (s_vis_enabled && state == DISPLAY_STATE_PLAYING &&
+        (vnow - last_vis) >= pdMS_TO_TICKS(50)) {
+      last_vis = vnow;
+      vis_update();
     }
 
     static TickType_t last_progress_update = 0;

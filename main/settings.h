@@ -93,6 +93,10 @@ esp_err_t settings_set_wifi_credentials(const char *ssid, const char *password);
  * Erase the stored WiFi credentials, returning the device to an unprovisioned
  * state so the setup portal is reachable again.
  */
+/// Spectrum visualiser in place of the progress bar. Off by default.
+bool settings_get_visualizer(void);
+esp_err_t settings_set_visualizer(bool enabled);
+
 esp_err_t settings_clear_wifi_credentials(void);
 
 bool settings_has_wifi_credentials(void);

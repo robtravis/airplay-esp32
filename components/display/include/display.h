@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sdkconfig.h"
+#include <stdbool.h>
 
 /**
  * OLED display module - Shows track metadata, playback position &
@@ -48,6 +49,17 @@ void display_menu_show(const char *header, const char **items, int count,
 
 /// Leave the menu and return to whatever was on screen before.
 void display_menu_hide(void);
+
+/**
+ * Show a spectrum visualiser in place of the progress bar.
+ *
+ * Off by default. It adds a 20fps partial repaint, and display work starving the
+ * audio pump is this firmware's known failure mode — so it stays something the
+ * user opts into, and the `gaps=`/`outliers=` counters are worth watching after
+ * turning it on.
+ */
+void display_set_visualizer(bool enabled);
+bool display_get_visualizer(void);
 #else
 static inline void display_show_setup(const char *ssid, const char *ip) {
   (void)ssid;
@@ -62,6 +74,12 @@ static inline void display_menu_show(const char *header, const char **items,
   (void)sel;
 }
 static inline void display_menu_hide(void) {}
+static inline void display_set_visualizer(bool enabled) {
+  (void)enabled;
+}
+static inline bool display_get_visualizer(void) {
+  return false;
+}
 #endif
 
 #else
@@ -82,5 +100,11 @@ static inline void display_menu_show(const char *header, const char **items,
   (void)sel;
 }
 static inline void display_menu_hide(void) {}
+static inline void display_set_visualizer(bool enabled) {
+  (void)enabled;
+}
+static inline bool display_get_visualizer(void) {
+  return false;
+}
 
 #endif

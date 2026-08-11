@@ -12,6 +12,7 @@ static const char *TAG = "settings";
 #ifdef CONFIG_BT_A2DP_ENABLE
 #define NVS_KEY_BT_VOLUME "bt_vol"
 #endif
+#define NVS_KEY_VISUALIZER     "vis"
 #define NVS_KEY_WIFI_SSID      "wifi_ssid"
 #define NVS_KEY_WIFI_PASSWORD  "wifi_pass"
 #define NVS_KEY_DEVICE_NAME    "device_name"
@@ -262,6 +263,31 @@ esp_err_t settings_set_wifi_credentials(const char *ssid,
     ESP_LOGE(TAG, "Failed to save WiFi credentials: %s", esp_err_to_name(err));
   }
 
+  return err;
+}
+
+bool settings_get_visualizer(void) {
+  nvs_handle_t nvs;
+  // On by default: verified clean on hardware (ring depth steady, no gaps), and
+  // it is the feature that makes the device feel alive. Still switchable in the
+  // menu, and still the first thing to turn off if audio ever misbehaves.
+  uint8_t v = 1;
+  if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+    nvs_get_u8(nvs, NVS_KEY_VISUALIZER, &v);
+    nvs_close(nvs);
+  }
+  return v != 0;
+}
+
+esp_err_t settings_set_visualizer(bool enabled) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    return err;
+  }
+  err = nvs_set_u8(nvs, NVS_KEY_VISUALIZER, enabled ? 1 : 0);
+  nvs_commit(nvs);
+  nvs_close(nvs);
   return err;
 }
 

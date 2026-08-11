@@ -49,6 +49,7 @@ typedef enum {
   ACT_PLAY_EPISODE,
   ACT_STOP_ARCHIVE,
   ACT_FORGET_NETWORK,
+  ACT_TOGGLE_VIS,
 } action_t;
 
 // Must hold the whole archive show list plus "< BACK": 40 shows truncated at 16
@@ -113,6 +114,8 @@ static void build_and_draw(void) {
 #endif
     row_add(ACT_NONE, 0, "VOLUME: %d%%",
             playback_control_get_volume_percent());
+    row_add(ACT_TOGGLE_VIS, 0, "VISUALIZER: %s",
+            display_get_visualizer() ? "ON" : "OFF");
     row_add(ACT_OPEN_LEVEL, LEVEL_NETWORK, "NETWORK");
     row_add(ACT_OPEN_LEVEL, LEVEL_INFO, "INFO");
     break;
@@ -364,6 +367,13 @@ void menu_select(void) {
     // little stack) nor with the menu mutex held.
     wifi_forget_network_async();
     return;
+
+  case ACT_TOGGLE_VIS: {
+    bool on = !display_get_visualizer();
+    display_set_visualizer(on);
+    settings_set_visualizer(on);
+    break;
+  }
 
   case ACT_NONE:
   default:

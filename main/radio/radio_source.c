@@ -12,6 +12,7 @@
 #include "rtsp_events.h"
 #include "esp_timer.h"
 #include "freertos/queue.h"
+#include "audio_vis.h"
 #include "cJSON.h"
 #include <math.h>
 
@@ -502,6 +503,10 @@ static void radio_drain_task(void *arg) {
         // silently discards audio and caps throughput below real time.
         // 16-bit stereo interleaved, so decoded_size/2 samples.
       apply_gain((int16_t *)pcm, frame.decoded_size / sizeof(int16_t));
+      // Post-gain, so the bars follow what is actually audible. This only copies
+      // a 128-sample window and returns; the transform runs on the display task.
+      audio_vis_push((const int16_t *)pcm,
+                     frame.decoded_size / sizeof(int16_t));
       esp_err_t werr = audio_output_write(pcm, frame.decoded_size, portMAX_DELAY);
         if (werr != ESP_OK) {
           write_errors++;

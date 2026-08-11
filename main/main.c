@@ -312,6 +312,7 @@ void app_main(void) {
   // runs from WiFi-up and the radio emits PLAYING once, so registering late
   // meant missing it and sitting in BOOT (a steady white ring) forever.
   led_ring_init();
+  display_set_visualizer(settings_get_visualizer());
 
   // Initialize LVGL-dependent board resources (e.g., touch input) after
   // display/LVGL port is ready.

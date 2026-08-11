@@ -43,6 +43,7 @@ set( SRC_FILES
     "audio/eq_events.c"
     "buttons.c"
     "encoder.c"
+    "audio_vis.c"
     "menu.c"
     "radio/archive.c"
     "playback_control.c"
