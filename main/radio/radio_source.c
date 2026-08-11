@@ -201,17 +201,30 @@ static void radio_drain_task(void *arg) {
     }
   }
 
-  // NOTE: we deliberately do not call audio_output_start() or _stop() here, and
-  // do not touch the sample rate. main.c has already initialised I2S at 44100 Hz
-  // and started the playback task; audio_output_write() is simply the producer
-  // side of that. Every attempt to manage the output from here raced AirPlay's
-  // ownership of the same channel and produced
-  // "i2s_channel_write: The channel is not enabled" with garbled audio.
-  // See the rate-change comment in the decode loop below.
+  // Take exclusive ownership of I2S before writing a single sample.
+  //
+  // audio_output_write() is NOT a queue — it calls i2s_channel_write() directly.
+  // Meanwhile main.c has started AirPlay's playback task, whose underflow branch
+  // writes a frame of SILENCE to the same channel whenever the receiver has
+  // nothing (i.e. constantly, with no AirPlay session). Two writers on one I2S
+  // channel interleave at frame granularity — music, silence, music, silence —
+  // which is precisely the garbling.
+  //
+  // It also throttled us: both writers block for DMA space, so decode ran at
+  // ~29 frames/sec against the 38.3 that 44.1kHz MP3 needs, and the ring backed
+  // up to full.
+  //
+  // So stop that task and do NOT restart it. audio_output_init() already enabled
+  // the channel and we are not changing the clock, so there is nothing to race.
+  // Handing back to AirPlay later means radio_source_stop() followed by
+  // audio_output_start() — that is the arbitration work.
+  audio_output_stop();
+  ESP_LOGI(TAG, "took I2S ownership (AirPlay playback task stopped)");
 
   size_t held = 0;            // bytes carried over from a partial frame
   uint32_t resync_bytes = 0;  // bytes skipped hunting for frame sync
   uint32_t frames = 0;        // successfully decoded frames
+  uint32_t write_errors = 0;  // i2s write failures
   while (s_running) {
     size_t want = HTTP_READ_CHUNK - held;
     size_t got =
@@ -282,7 +295,12 @@ static void radio_drain_task(void *arg) {
       }
 
       if (frame.decoded_size > 0) {
-        audio_output_write(pcm, frame.decoded_size, pdMS_TO_TICKS(200));
+        // portMAX_DELAY, as a2dp_sink does: real backpressure. A timeout here
+        // silently discards audio and caps throughput below real time.
+        esp_err_t werr = audio_output_write(pcm, frame.decoded_size, portMAX_DELAY);
+        if (werr != ESP_OK) {
+          write_errors++;
+        }
       }
 
       frames++;
@@ -299,8 +317,9 @@ static void radio_drain_task(void *arg) {
 
     // Carry the undecoded tail to the front for the next read.
     if (frames > 0 && (frames % 400) == 0) {
-      ESP_LOGI(TAG, "decoded %lu frames, %lu bytes skipped resyncing",
-               (unsigned long)frames, (unsigned long)resync_bytes);
+      ESP_LOGI(TAG, "decoded %lu frames, %lu resync bytes, %lu write errors",
+               (unsigned long)frames, (unsigned long)resync_bytes,
+               (unsigned long)write_errors);
     }
 
     held = raw.len;
@@ -390,8 +409,10 @@ void radio_source_stop(void) {
   for (int i = 0; i < 50 && (s_fill_task || s_drain_task); i++) {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
-  audio_output_stop();
-  ESP_LOGI(TAG, "stopped");
+  // Give the output back to AirPlay: restart the playback task we stopped when
+  // taking ownership.
+  audio_output_start();
+  ESP_LOGI(TAG, "stopped, I2S returned to AirPlay");
 }
 
 bool radio_source_is_playing(void) {
